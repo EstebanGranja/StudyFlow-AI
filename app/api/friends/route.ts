@@ -1,4 +1,5 @@
 import { getAuthenticatedContext, jsonResponse } from "@/lib/insforge/server-auth";
+import { type StudyStatusPlanRow, resolveCurrentStudyStatusMap } from "@/lib/study-plans/current-study-status";
 
 export const runtime = "nodejs";
 
@@ -78,6 +79,25 @@ export async function GET(request: Request): Promise<Response> {
       profilesByUserId.set(profile.user_id, profile);
     }
 
+    const referenceDate = new Date();
+    const startOfDayUtc = new Date(
+      Date.UTC(referenceDate.getUTCFullYear(), referenceDate.getUTCMonth(), referenceDate.getUTCDate()),
+    ).toISOString();
+
+    const { data: plansData, error: plansError } = await client.database
+      .from("study_plans")
+      .select("user_id, nombre, fecha_examen")
+      .in("user_id", friendIds)
+      .not("fecha_examen", "is", null)
+      .gte("fecha_examen", startOfDayUtc)
+      .order("fecha_examen", { ascending: true });
+
+    if (plansError) {
+      return jsonResponse({ error: `No se pudieron cargar los estados de estudio: ${plansError.message}` }, 500);
+    }
+
+    const statusByUserId = resolveCurrentStudyStatusMap((plansData as StudyStatusPlanRow[] | null) ?? []);
+
     const friends = friendIds
       .map((friendId) => {
         const profile = profilesByUserId.get(friendId);
@@ -89,6 +109,7 @@ export async function GET(request: Request): Promise<Response> {
           email: profile?.email ?? "",
           avatarUrl: profile?.avatar_url ?? null,
           friendsSince: friendship?.created_at ?? null,
+          studyStatusLabel: statusByUserId.get(friendId)?.label ?? null,
         };
       })
       .sort((left, right) => left.displayName.localeCompare(right.displayName, "es", { sensitivity: "base" }));

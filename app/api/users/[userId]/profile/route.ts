@@ -1,4 +1,5 @@
 import { getAuthenticatedContext, jsonResponse } from "@/lib/insforge/server-auth";
+import { resolveCurrentStudyStatusFromPlans } from "@/lib/study-plans/current-study-status";
 
 export const runtime = "nodejs";
 
@@ -9,7 +10,25 @@ type StudyPlanSummary = {
   fecha_examen: string | null;
   status: "processing" | "done" | "error";
   created_at: string;
+  progressPercent: number;
 };
+
+type StudyPlanProgressRow = {
+  plan_id: string | null;
+  progress_percent: number | null;
+};
+
+function clampProgressPercent(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function getFallbackPlanProgress(status: StudyPlanSummary["status"]): number {
+  return status === "done" ? 100 : 0;
+}
 
 function normalizePair(leftUserId: string, rightUserId: string): { userAId: string; userBId: string } {
   if (leftUserId < rightUserId) {
@@ -121,7 +140,28 @@ export async function GET(
       return jsonResponse({ error: `No se pudieron cargar los planes: ${plansError.message}` }, 500);
     }
 
-    const plans = ((plansData as StudyPlanSummary[] | null) ?? []).filter((plan) => Boolean(plan?.id));
+    const { data: progressData, error: progressError } = await client.database.rpc(
+      "get_user_plan_progress_summary",
+      { target_user_id: userId },
+    );
+
+    const progressByPlanId = new Map<string, number>();
+
+    for (const row of progressError ? [] : ((progressData as StudyPlanProgressRow[] | null) ?? [])) {
+      if (!row?.plan_id || typeof row.progress_percent !== "number") {
+        continue;
+      }
+
+      progressByPlanId.set(row.plan_id, clampProgressPercent(row.progress_percent));
+    }
+
+    const plans = (((plansData as Omit<StudyPlanSummary, "progressPercent">[] | null) ?? [])
+      .filter((plan) => Boolean(plan?.id))
+      .map((plan) => ({
+        ...plan,
+        progressPercent: progressByPlanId.get(plan.id) ?? getFallbackPlanProgress(plan.status),
+      })));
+    const currentStudyStatus = resolveCurrentStudyStatusFromPlans(plans);
 
     return jsonResponse({
       success: true,
@@ -130,6 +170,7 @@ export async function GET(
         email: profileData.email,
         displayName: profileData.display_name,
         avatarUrl: profileData.avatar_url,
+        studyStatusLabel: currentStudyStatus?.label ?? null,
       },
       relation: {
         status: relationStatus,

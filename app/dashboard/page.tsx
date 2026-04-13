@@ -3,11 +3,19 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type FormEvent, useEffect, useState } from "react";
-import { FiBell, FiEdit2, FiLogOut, FiRefreshCw, FiUserPlus, FiUsers } from "react-icons/fi";
+import { FiBell, FiCheck, FiEdit2, FiImage, FiLogOut, FiRefreshCw, FiUserPlus, FiUsers } from "react-icons/fi";
 import { LoadingSpinner } from "@/components/loading-spinner";
 import { NewStudyPlanButton } from "@/components/study-plans/new-study-plan-button";
 import { getInsforgeClient } from "@/lib/insforge/client";
 import { ensureUserSettings } from "@/lib/insforge/ensure-user-settings";
+import { resolveCurrentStudyStatusFromPlans } from "@/lib/study-plans/current-study-status";
+import {
+  DEFAULT_USER_BACKGROUND_THEME,
+  USER_BACKGROUND_THEME_OPTIONS,
+  getUserBackgroundImagePath,
+  normalizeUserBackgroundTheme,
+  type UserBackgroundTheme,
+} from "@/lib/user-background-theme";
 
 type AuthUser = {
   id: string;
@@ -22,6 +30,7 @@ type UserSettings = {
   display_name: string | null;
   avatar_url: string | null;
   onboarding_completed: boolean;
+  background_theme: UserBackgroundTheme;
 };
 
 type UserProfileApiResponse = {
@@ -32,6 +41,7 @@ type UserProfileApiResponse = {
     email?: string;
     displayName?: string;
     avatarUrl?: string | null;
+    backgroundTheme?: UserBackgroundTheme;
   };
 };
 
@@ -42,11 +52,13 @@ type StudyPlanSummary = {
   fecha_examen: string | null;
   status: "processing" | "done" | "error";
   created_at: string;
+  progressPercent: number;
 };
 
-type DeleteStudyPlanResponse = {
-  success?: boolean;
-  error?: string;
+type StudyDocumentProgressRow = {
+  plan_id: string | null;
+  page_count: number | null;
+  pages_read: number | null;
 };
 
 type SocialUserSummary = {
@@ -54,6 +66,7 @@ type SocialUserSummary = {
   displayName: string;
   email: string;
   avatarUrl: string | null;
+  studyStatusLabel?: string | null;
 };
 
 type ContactSearchApiResponse = {
@@ -148,16 +161,48 @@ function buildInitialDiceBearAvatarsByCategory(): Record<AvatarCategoryId, strin
   );
 }
 
-function formatPlanStatus(status: StudyPlanSummary["status"]): string {
-  if (status === "done") {
-    return "Listo";
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
   }
 
-  if (status === "processing") {
-    return "En revision";
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function getFallbackPlanProgress(status: StudyPlanSummary["status"]): number {
+  return status === "done" ? 100 : 0;
+}
+
+function calculatePlanProgressPercent(documents: StudyDocumentProgressRow[]): number | null {
+  let totalPages = 0;
+  let pagesRead = 0;
+  let trackedDocuments = 0;
+
+  for (const document of documents) {
+    if (typeof document.page_count !== "number" || !Number.isFinite(document.page_count) || document.page_count <= 0) {
+      continue;
+    }
+
+    const normalizedTotalPages = Math.trunc(document.page_count);
+    const normalizedPagesRead =
+      typeof document.pages_read === "number" && Number.isFinite(document.pages_read)
+        ? Math.max(0, Math.trunc(document.pages_read))
+        : 0;
+
+    trackedDocuments += 1;
+    totalPages += normalizedTotalPages;
+    pagesRead += Math.min(normalizedPagesRead, normalizedTotalPages);
   }
 
-  return "Con error";
+  if (trackedDocuments === 0 || totalPages <= 0) {
+    return null;
+  }
+
+  return clampPercent((pagesRead / totalPages) * 100);
+}
+
+function getPlanProgressLabel(progressPercent: number): "En curso" | "Finalizado" {
+  return progressPercent >= 100 ? "Finalizado" : "En curso";
 }
 
 function formatExamDate(examDate: string | null): string {
@@ -177,6 +222,90 @@ function formatExamDate(examDate: string | null): string {
     year: "numeric",
     timeZone: "UTC",
   }).format(parsedDate);
+}
+
+function PlanProgressCircle({
+  progressPercent,
+  animate,
+  animationTrigger,
+}: {
+  progressPercent: number;
+  animate: boolean;
+  animationTrigger: number;
+}) {
+  const size = 72;
+  const strokeWidth = 7;
+  const radius = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const clampedProgress = clampPercent(progressPercent);
+  const [displayProgress, setDisplayProgress] = useState(clampedProgress);
+  const [isProgressResetting, setIsProgressResetting] = useState(false);
+
+  useEffect(() => {
+    if (!animate) {
+      setIsProgressResetting(false);
+      setDisplayProgress(clampedProgress);
+    }
+  }, [animate, clampedProgress]);
+
+  useEffect(() => {
+    if (!animate) {
+      return;
+    }
+
+    setIsProgressResetting(true);
+    setDisplayProgress(0);
+
+    const timeoutId = window.setTimeout(() => {
+      setIsProgressResetting(false);
+      setDisplayProgress(clampedProgress);
+    }, 45);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [animate, animationTrigger, clampedProgress]);
+
+  const strokeDashoffset = circumference * (1 - displayProgress / 100);
+
+  return (
+    <div
+      className="relative inline-flex h-[72px] w-[72px] shrink-0 items-center justify-center"
+      role="img"
+      aria-label={`Progreso del plan: ${clampedProgress}%`}
+      title={`Progreso del plan: ${clampedProgress}%`}
+    >
+      <svg
+        viewBox={`0 0 ${size} ${size}`}
+        className={`h-[72px] w-[72px] -rotate-90 transition-[filter] duration-300 ${
+          animate ? "drop-shadow-[0_0_4px_rgba(70,237,213,0.28)]" : ""
+        }`}
+        aria-hidden="true"
+      >
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          stroke="rgb(63 63 70)"
+          strokeWidth={strokeWidth}
+          fill="transparent"
+        />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          stroke="#46edd5"
+          strokeWidth={strokeWidth}
+          strokeLinecap="round"
+          fill="transparent"
+          strokeDasharray={circumference}
+          strokeDashoffset={strokeDashoffset}
+          className={isProgressResetting ? "transition-none" : "transition-[stroke-dashoffset] duration-500 ease-out"}
+        />
+      </svg>
+      <span className="absolute text-sm font-semibold text-zinc-100">{clampedProgress}%</span>
+    </div>
+  );
 }
 
 function resolveDisplayName(user: AuthUser | null, settings: UserSettings | null): string {
@@ -217,6 +346,15 @@ function resolveAvatarInitial(displayName: string, email: string | undefined): s
   return "U";
 }
 
+function resolveStudyStatusLabel(studyStatusLabel: string | null | undefined): string {
+  if (!studyStatusLabel) {
+    return "Sin plan en curso";
+  }
+
+  const normalized = studyStatusLabel.replace(/\s+/g, " ").trim();
+  return normalized.length > 0 ? normalized : "Sin plan en curso";
+}
+
 export default function DashboardPage() {
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(true);
@@ -224,8 +362,6 @@ export default function DashboardPage() {
   const [settings, setSettings] = useState<UserSettings | null>(null);
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
   const [plans, setPlans] = useState<StudyPlanSummary[]>([]);
-  const [deletingPlanId, setDeletingPlanId] = useState<string | null>(null);
-  const [deleteErrorMessage, setDeleteErrorMessage] = useState<string | null>(null);
   const [isProfileEditorOpen, setIsProfileEditorOpen] = useState(false);
   const [profileDraftName, setProfileDraftName] = useState("");
   const [selectedAvatarCategory, setSelectedAvatarCategory] =
@@ -237,6 +373,11 @@ export default function DashboardPage() {
   const [isSavingProfile, setIsSavingProfile] = useState(false);
   const [profileErrorMessage, setProfileErrorMessage] = useState<string | null>(null);
   const [profileSuccessMessage, setProfileSuccessMessage] = useState<string | null>(null);
+  const [isBackgroundMenuOpen, setIsBackgroundMenuOpen] = useState(false);
+  const [isUpdatingBackgroundTheme, setIsUpdatingBackgroundTheme] = useState(false);
+  const [isBackgroundImageLoading, setIsBackgroundImageLoading] = useState(false);
+  const [backgroundThemeMessage, setBackgroundThemeMessage] = useState<string | null>(null);
+  const [backgroundThemeErrorMessage, setBackgroundThemeErrorMessage] = useState<string | null>(null);
   const [isContactSearchOpen, setIsContactSearchOpen] = useState(false);
   const [contactSearchQuery, setContactSearchQuery] = useState("");
   const [contactSearchResults, setContactSearchResults] = useState<SocialUserSummary[]>([]);
@@ -253,6 +394,8 @@ export default function DashboardPage() {
   const [respondingFriendRequestId, setRespondingFriendRequestId] = useState<string | null>(null);
   const [socialMessage, setSocialMessage] = useState<string | null>(null);
   const [socialErrorMessage, setSocialErrorMessage] = useState<string | null>(null);
+  const [hoveredPlanId, setHoveredPlanId] = useState<string | null>(null);
+  const [planHoverAnimationTokens, setPlanHoverAnimationTokens] = useState<Record<string, number>>({});
 
   useEffect(() => {
     let isCancelled = false;
@@ -296,18 +439,62 @@ export default function DashboardPage() {
         .eq("user_id", sessionUser.id)
         .order("created_at", { ascending: false });
 
+      const { data: planDocumentsData, error: planDocumentsError } = await client.database
+        .from("study_documents")
+        .select("plan_id, page_count, pages_read")
+        .eq("user_id", sessionUser.id);
+
       if (plansError) {
         warnings.push(`planes: ${plansError.message}`);
       }
 
-      const resolvedSettings = (endpointData?.settings as UserSettings | null) ?? null;
+      if (planDocumentsError) {
+        warnings.push(`progreso de planes: ${planDocumentsError.message}`);
+      }
+
+      const progressDocumentsByPlanId = new Map<string, StudyDocumentProgressRow[]>();
+
+      for (const document of (planDocumentsData as StudyDocumentProgressRow[] | null) ?? []) {
+        const planId = document.plan_id;
+
+        if (!planId) {
+          continue;
+        }
+
+        const existingDocuments = progressDocumentsByPlanId.get(planId) ?? [];
+        existingDocuments.push(document);
+        progressDocumentsByPlanId.set(planId, existingDocuments);
+      }
+
+      const resolvedPlans = (((plansData as Omit<StudyPlanSummary, "progressPercent">[] | null) ?? [])
+        .filter((plan) => Boolean(plan?.id))
+        .map((plan) => {
+          const planDocuments = progressDocumentsByPlanId.get(plan.id) ?? [];
+          const calculatedProgress = calculatePlanProgressPercent(planDocuments);
+
+          return {
+            ...plan,
+            progressPercent: calculatedProgress ?? getFallbackPlanProgress(plan.status),
+          };
+        }));
+
+      const resolvedSettingsFromApi = (endpointData?.settings as Partial<UserSettings> | null) ?? null;
+      const resolvedSettings = resolvedSettingsFromApi
+        ? {
+            user_id: resolvedSettingsFromApi.user_id ?? sessionUser.id,
+            display_name: resolvedSettingsFromApi.display_name ?? null,
+            avatar_url: resolvedSettingsFromApi.avatar_url ?? null,
+            onboarding_completed: resolvedSettingsFromApi.onboarding_completed ?? false,
+            background_theme: normalizeUserBackgroundTheme(resolvedSettingsFromApi.background_theme),
+          }
+        : null;
       const resolvedDisplayName = resolveDisplayName(sessionUser, resolvedSettings);
 
       if (!isCancelled) {
         setUser(sessionUser);
         setSettings(resolvedSettings);
         setProfileDraftName(resolvedDisplayName);
-        setPlans(((plansData as StudyPlanSummary[] | null) ?? []).filter((plan) => Boolean(plan?.id)));
+        setPlans(resolvedPlans);
         setWarningMessage(warnings.length > 0 ? warnings.join(" | ") : null);
         setIsLoading(false);
       }
@@ -474,6 +661,7 @@ export default function DashboardPage() {
 
   function handleOpenContactSearchModal() {
     setIsNotificationsOpen(false);
+    setIsBackgroundMenuOpen(false);
     setIsContactSearchOpen(true);
     setContactSearchQuery("");
     setContactSearchResults([]);
@@ -491,6 +679,7 @@ export default function DashboardPage() {
 
   function handleOpenFriendsModal() {
     setIsNotificationsOpen(false);
+    setIsBackgroundMenuOpen(false);
     setIsFriendsModalOpen(true);
     setSocialErrorMessage(null);
     setSocialMessage(null);
@@ -502,6 +691,8 @@ export default function DashboardPage() {
   }
 
   function handleToggleNotificationsMenu() {
+    setIsBackgroundMenuOpen(false);
+
     if (isNotificationsOpen) {
       setIsNotificationsOpen(false);
       return;
@@ -618,6 +809,61 @@ export default function DashboardPage() {
     setIsProfileEditorOpen(true);
   }
 
+  async function handleChangeBackgroundTheme(nextTheme: UserBackgroundTheme) {
+    if (isUpdatingBackgroundTheme) {
+      return;
+    }
+
+    setIsBackgroundMenuOpen(false);
+    setBackgroundThemeErrorMessage(null);
+    setBackgroundThemeMessage(null);
+
+    const currentTheme = normalizeUserBackgroundTheme(settings?.background_theme);
+
+    if (nextTheme === currentTheme) {
+      return;
+    }
+
+    setIsUpdatingBackgroundTheme(true);
+
+    try {
+      const authorization = getAuthHeaderForApiRequest();
+      const response = await fetch("/api/user-profile", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: authorization,
+        },
+        body: JSON.stringify({
+          background_theme: nextTheme,
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as UserProfileApiResponse | null;
+
+      if (!response.ok) {
+        const message = payload?.error?.trim();
+        throw new Error(message && message.length > 0 ? message : "No se pudo actualizar el fondo.");
+      }
+
+      const updatedBackgroundTheme = normalizeUserBackgroundTheme(payload?.profile?.backgroundTheme ?? nextTheme);
+
+      setSettings((previousSettings) => ({
+        user_id: previousSettings?.user_id ?? user?.id ?? "",
+        display_name: previousSettings?.display_name ?? null,
+        avatar_url: previousSettings?.avatar_url ?? null,
+        onboarding_completed: previousSettings?.onboarding_completed ?? false,
+        background_theme: updatedBackgroundTheme,
+      }));
+      setBackgroundThemeMessage("Fondo actualizado correctamente.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "No se pudo actualizar el fondo.";
+      setBackgroundThemeErrorMessage(message);
+    } finally {
+      setIsUpdatingBackgroundTheme(false);
+    }
+  }
+
   async function handleSaveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setProfileErrorMessage(null);
@@ -678,6 +924,9 @@ export default function DashboardPage() {
         display_name: updatedDisplayName,
         avatar_url: updatedAvatarUrl,
         onboarding_completed: previousSettings?.onboarding_completed ?? false,
+        background_theme: normalizeUserBackgroundTheme(
+          payload?.profile?.backgroundTheme ?? previousSettings?.background_theme ?? DEFAULT_USER_BACKGROUND_THEME,
+        ),
       }));
       setProfileDraftName(updatedDisplayName);
       setSelectedDiceBearAvatarUrl(null);
@@ -690,46 +939,34 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleDeletePlan(plan: StudyPlanSummary) {
-    if (deletingPlanId) {
-      return;
-    }
+  const activeBackgroundTheme = normalizeUserBackgroundTheme(settings?.background_theme);
+  const activeBackgroundImagePath = getUserBackgroundImagePath(activeBackgroundTheme);
 
-    const confirmed = window.confirm(
-      `Se eliminara el plan "${plan.nombre}" junto con documentos, temas y PDFs en el bucket. Esta accion no se puede deshacer.`,
-    );
+  useEffect(() => {
+    let isCancelled = false;
 
-    if (!confirmed) {
-      return;
-    }
+    setIsBackgroundImageLoading(true);
 
-    setDeleteErrorMessage(null);
-    setDeletingPlanId(plan.id);
+    const image = new Image();
 
-    try {
-      const response = await fetch(`/api/study-plans/${plan.id}`, {
-        method: "DELETE",
-        headers: {
-          Authorization: getAuthHeaderForApiRequest(),
-        },
-      });
-
-      const payload = (await response.json().catch(() => null)) as DeleteStudyPlanResponse | null;
-
-      if (!response.ok) {
-        const message = payload?.error?.trim();
-        throw new Error(message && message.length > 0 ? message : "No se pudo eliminar el plan de estudio.");
+    image.onload = () => {
+      if (!isCancelled) {
+        setIsBackgroundImageLoading(false);
       }
+    };
 
-      setPlans((previousPlans) => previousPlans.filter((currentPlan) => currentPlan.id !== plan.id));
-      router.refresh();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "No se pudo eliminar el plan de estudio.";
-      setDeleteErrorMessage(message);
-    } finally {
-      setDeletingPlanId(null);
-    }
-  }
+    image.onerror = () => {
+      if (!isCancelled) {
+        setIsBackgroundImageLoading(false);
+      }
+    };
+
+    image.src = activeBackgroundImagePath;
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [activeBackgroundImagePath]);
 
   if (isLoading) {
     return (
@@ -745,11 +982,19 @@ export default function DashboardPage() {
   const displayName = resolveDisplayName(user, settings);
   const avatarUrl = selectedDiceBearAvatarUrl ?? settings?.avatar_url ?? null;
   const avatarInitial = resolveAvatarInitial(displayName, user?.email);
+  const currentStudyStatus = resolveCurrentStudyStatusFromPlans(plans);
   const currentAvatarOptions = diceBearAvatarsByCategory[selectedAvatarCategory] ?? [];
 
   return (
-    <div className="min-h-screen bg-zinc-950 px-6 py-12 text-zinc-100">
-      <main className="mx-auto w-full max-w-5xl space-y-6">
+    <div className="relative min-h-screen overflow-hidden bg-zinc-950 px-6 py-12 text-zinc-100">
+      <div
+        className="absolute inset-0 bg-cover bg-center bg-no-repeat"
+        style={{ backgroundImage: `url('${activeBackgroundImagePath}')` }}
+        aria-hidden="true"
+      />
+      <div className="absolute inset-0 bg-black/55" aria-hidden="true" />
+
+      <main className="relative z-10 mx-auto w-full max-w-5xl space-y-6">
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-8">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
@@ -775,6 +1020,60 @@ export default function DashboardPage() {
                 <FiUsers className="h-4 w-4" aria-hidden="true" />
                 Amigos
               </button>
+
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsNotificationsOpen(false);
+                    setIsBackgroundMenuOpen((currentValue) => !currentValue);
+                    setBackgroundThemeErrorMessage(null);
+                    setBackgroundThemeMessage(null);
+                  }}
+                  aria-label="Cambiar fondo"
+                  title="Cambiar fondo"
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-700 text-zinc-300 transition hover:border-zinc-500 hover:bg-zinc-800"
+                >
+                  {isBackgroundImageLoading ? (
+                    <LoadingSpinner size="sm" className="border-zinc-500 border-t-teal-200" />
+                  ) : (
+                    <FiImage className="h-4 w-4" aria-hidden="true" />
+                  )}
+                </button>
+
+                {isBackgroundMenuOpen ? (
+                  <div className="absolute right-0 z-20 mt-2 w-64 rounded-xl border border-zinc-700 bg-zinc-900 p-2 shadow-[0_20px_50px_rgba(0,0,0,0.45)]">
+                    <p className="px-2 pb-1 pt-1 text-xs font-semibold uppercase tracking-[0.08em] text-zinc-400">
+                      Fondos
+                    </p>
+                    <div className="space-y-1">
+                      {USER_BACKGROUND_THEME_OPTIONS.map((themeOption) => {
+                        const isActive = themeOption.key === activeBackgroundTheme;
+
+                        return (
+                          <button
+                            key={themeOption.key}
+                            type="button"
+                            disabled={isUpdatingBackgroundTheme}
+                            onClick={() => void handleChangeBackgroundTheme(themeOption.key)}
+                            className="flex w-full items-center justify-between rounded-lg px-2 py-2 text-left text-sm text-zinc-100 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <span className="inline-flex items-center gap-2">
+                              <span
+                                className="h-3 w-3 rounded-full border border-white/30"
+                                style={{ backgroundColor: themeOption.swatchColor }}
+                                aria-hidden="true"
+                              />
+                              <span>{themeOption.label}</span>
+                            </span>
+                            {isActive ? <FiCheck className="h-4 w-4 text-teal-300" aria-hidden="true" /> : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
 
               <div className="relative">
                 <button
@@ -897,7 +1196,11 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <div className="mt-7 rounded-2xl border border-zinc-800 bg-zinc-950 p-5">
+          <div className="relative mt-7 rounded-2xl border border-zinc-800 bg-zinc-950 p-5">
+            <p className="pointer-events-none absolute left-1/2 top-1/2 inline-flex max-w-[14rem] -translate-x-1/2 -translate-y-1/2 rounded-full border border-sky-300/30 bg-sky-300/10 px-2.5 py-1 text-[11px] font-medium text-sky-200/85 sm:max-w-[20rem]">
+              <span className="truncate">{resolveStudyStatusLabel(currentStudyStatus?.label)}</span>
+            </p>
+
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div className="flex min-w-0 items-center gap-4">
                 <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-full border border-zinc-700 bg-zinc-900 text-xl font-semibold text-teal-200">
@@ -918,14 +1221,16 @@ export default function DashboardPage() {
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={handleToggleProfileEditor}
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-zinc-700 px-4 text-sm font-semibold text-zinc-100 transition hover:border-zinc-500 hover:bg-zinc-800"
-              >
-                <FiEdit2 className="h-4 w-4" aria-hidden="true" />
-                {isProfileEditorOpen ? "Cerrar editor" : "Editar perfil"}
-              </button>
+              <div className="ml-auto flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleToggleProfileEditor}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-zinc-700 px-4 text-sm font-semibold text-zinc-100 transition hover:border-zinc-500 hover:bg-zinc-800"
+                >
+                  <FiEdit2 className="h-4 w-4" aria-hidden="true" />
+                  {isProfileEditorOpen ? "Cerrar editor" : "Editar perfil"}
+                </button>
+              </div>
             </div>
 
             {isProfileEditorOpen ? (
@@ -1068,26 +1373,32 @@ export default function DashboardPage() {
               {socialMessage}
             </p>
           ) : null}
+
+          {backgroundThemeErrorMessage ? (
+            <p className="mt-3 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+              {backgroundThemeErrorMessage}
+            </p>
+          ) : null}
+
+          {backgroundThemeMessage ? (
+            <p className="mt-3 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+              {backgroundThemeMessage}
+            </p>
+          ) : null}
         </section>
 
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-8">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
-              <h2 className="text-xl font-semibold text-white">Tus planes de estudio</h2>
-              <p className="mt-1 text-xs uppercase tracking-[0.1em] text-zinc-400">{plans.length} total</p>
+              <h2 className="text-2xl font-semibold text-white">Tus planes de estudio</h2>
+              <p className="mt-1 text-sm uppercase tracking-[0.1em] text-zinc-400">{plans.length} total</p>
             </div>
 
             <NewStudyPlanButton />
           </div>
 
-          {deleteErrorMessage ? (
-            <p className="mt-4 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
-              {deleteErrorMessage}
-            </p>
-          ) : null}
-
           {plans.length === 0 ? (
-            <p className="mt-5 text-sm text-zinc-400">
+            <p className="mt-5 text-base text-zinc-400">
               Aun no tienes planes creados. Usa el boton de arriba para subir tu primer PDF.
             </p>
           ) : (
@@ -1095,47 +1406,52 @@ export default function DashboardPage() {
               {plans.map((plan) => (
                 <article
                   key={plan.id}
-                  className="rounded-xl border border-zinc-800 bg-zinc-950 p-5 transition hover:border-zinc-600 hover:bg-zinc-900"
+                  onMouseEnter={() => {
+                    setHoveredPlanId(plan.id);
+                    setPlanHoverAnimationTokens((previousTokens) => ({
+                      ...previousTokens,
+                      [plan.id]: (previousTokens[plan.id] ?? 0) + 1,
+                    }));
+                  }}
+                  onMouseLeave={() => {
+                    setHoveredPlanId((currentPlanId) => (currentPlanId === plan.id ? null : currentPlanId));
+                  }}
+                  className="rounded-2xl border border-zinc-800 bg-zinc-950 p-6 transition-all duration-300 hover:-translate-y-0.5 hover:scale-[1.015] hover:border-[#46edd5] hover:bg-zinc-900 hover:shadow-[0_0_0_1px_rgba(70,237,213,0.38),0_0_14px_rgba(70,237,213,0.14)] focus-within:-translate-y-0.5 focus-within:scale-[1.015] focus-within:border-[#46edd5] focus-within:shadow-[0_0_0_1px_rgba(70,237,213,0.38),0_0_14px_rgba(70,237,213,0.14)]"
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <Link href={`/dashboard/plans/${plan.id}`} className="min-w-0 flex-1">
-                      <p className="text-sm font-semibold text-zinc-100">{plan.nombre}</p>
+                  <div className="flex items-start justify-between gap-4">
+                    <Link
+                      href={`/dashboard/plans/${plan.id}`}
+                      className="min-w-0 flex-1"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-lg font-semibold text-zinc-100">{plan.nombre}</p>
+                        <span
+                          className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${
+                            plan.progressPercent >= 100
+                              ? "border-emerald-300/60 bg-emerald-400/10 text-emerald-200"
+                              : "border-cyan-300/50 bg-cyan-400/10 text-cyan-100"
+                          }`}
+                        >
+                          {getPlanProgressLabel(plan.progressPercent)}
+                        </span>
+                      </div>
 
                       {plan.description ? (
-                        <p className="mt-3 line-clamp-2 text-xs leading-5 text-zinc-400">{plan.description}</p>
+                        <p className="mt-3 line-clamp-2 text-sm leading-6 text-zinc-300">{plan.description}</p>
                       ) : (
-                        <p className="mt-3 text-xs leading-5 text-zinc-500">Sin descripcion.</p>
+                        <p className="mt-3 text-sm leading-6 text-zinc-500">Sin descripcion.</p>
                       )}
 
-                      <div className="mt-4 flex items-center justify-between text-[11px] text-zinc-500">
+                      <div className="mt-4 text-sm text-zinc-400">
                         <span>Examen: {formatExamDate(plan.fecha_examen)}</span>
-                        <span>{new Date(plan.created_at).toLocaleDateString()}</span>
                       </div>
                     </Link>
 
-                    <div className="flex shrink-0 flex-col items-end gap-2">
-                      <span className="rounded-full border border-zinc-700 px-2.5 py-1 text-[11px] text-zinc-300">
-                        {formatPlanStatus(plan.status)}
-                      </span>
-
-                      <button
-                        type="button"
-                        onClick={() => void handleDeletePlan(plan)}
-                        disabled={deletingPlanId === plan.id}
-                        aria-label={`Eliminar plan ${plan.nombre}`}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 transition hover:border-red-400 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4" aria-hidden="true">
-                          <path
-                            d="M4 7h16M10 11v6m4-6v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"
-                            stroke="currentColor"
-                            strokeWidth="1.5"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                          />
-                        </svg>
-                      </button>
-                    </div>
+                    <PlanProgressCircle
+                      progressPercent={plan.progressPercent}
+                      animate={hoveredPlanId === plan.id}
+                      animationTrigger={planHoverAnimationTokens[plan.id] ?? 0}
+                    />
                   </div>
                 </article>
               ))}
@@ -1146,7 +1462,7 @@ export default function DashboardPage() {
       </main>
 
       {isContactSearchOpen ? (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <div className="w-full max-w-2xl rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-[0_30px_80px_rgba(0,0,0,0.55)] sm:p-7">
             <div className="flex items-center justify-between gap-4">
               <div>
@@ -1219,10 +1535,14 @@ export default function DashboardPage() {
                       )}
                     </div>
 
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-semibold text-zinc-100">{contact.displayName}</p>
                       <p className="truncate text-xs text-zinc-400">{contact.email}</p>
                     </div>
+
+                    <p className="ml-auto inline-flex max-w-[14rem] shrink-0 rounded-full border border-sky-300/30 bg-sky-300/10 px-2 py-0.5 text-[10px] font-medium text-sky-200/85">
+                      <span className="truncate">{resolveStudyStatusLabel(contact.studyStatusLabel)}</span>
+                    </p>
                   </Link>
                 ))}
               </div>
@@ -1232,7 +1552,7 @@ export default function DashboardPage() {
       ) : null}
 
       {isFriendsModalOpen ? (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <div className="w-full max-w-2xl rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-[0_30px_80px_rgba(0,0,0,0.55)] sm:p-7">
             <div className="flex items-center justify-between gap-4">
               <div>
@@ -1287,10 +1607,14 @@ export default function DashboardPage() {
                       )}
                     </div>
 
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-semibold text-zinc-100">{friend.displayName}</p>
                       <p className="truncate text-xs text-zinc-400">{friend.email}</p>
                     </div>
+
+                    <p className="ml-auto inline-flex max-w-[14rem] shrink-0 rounded-full border border-sky-300/30 bg-sky-300/10 px-2 py-0.5 text-[10px] font-medium text-sky-200/85">
+                      <span className="truncate">{resolveStudyStatusLabel(friend.studyStatusLabel)}</span>
+                    </p>
                   </Link>
                 ))}
               </div>

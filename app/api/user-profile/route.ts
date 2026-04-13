@@ -1,4 +1,9 @@
 import { createClient } from "@insforge/sdk";
+import {
+  DEFAULT_USER_BACKGROUND_THEME,
+  isUserBackgroundTheme,
+  type UserBackgroundTheme,
+} from "@/lib/user-background-theme";
 
 export const runtime = "nodejs";
 
@@ -15,6 +20,7 @@ type UserSettingsRow = {
   display_name: string | null;
   avatar_url: string | null;
   onboarding_completed: boolean;
+  background_theme: UserBackgroundTheme;
 };
 
 type UserProfileResponse = {
@@ -22,6 +28,7 @@ type UserProfileResponse = {
   email: string;
   displayName: string;
   avatarUrl: string | null;
+  backgroundTheme: UserBackgroundTheme;
 };
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -151,6 +158,42 @@ function normalizeDiceBearAvatarUrl(value: unknown): {
   };
 }
 
+function normalizeBackgroundTheme(value: unknown): {
+  isProvided: boolean;
+  value: UserBackgroundTheme;
+  error?: string;
+} {
+  if (value === undefined) {
+    return {
+      isProvided: false,
+      value: DEFAULT_USER_BACKGROUND_THEME,
+    };
+  }
+
+  if (typeof value !== "string") {
+    return {
+      isProvided: true,
+      value: DEFAULT_USER_BACKGROUND_THEME,
+      error: "background_theme debe ser un string.",
+    };
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  if (!isUserBackgroundTheme(normalized)) {
+    return {
+      isProvided: true,
+      value: DEFAULT_USER_BACKGROUND_THEME,
+      error: "background_theme debe ser uno de: celeste, rojo, amarillo, violeta.",
+    };
+  }
+
+  return {
+    isProvided: true,
+    value: normalized,
+  };
+}
+
 function buildUserProfilePayload(user: AuthenticatedUser, settings: UserSettingsRow): UserProfileResponse {
   const displayName = settings.display_name?.trim() || resolveDisplayNameFallback(user);
 
@@ -159,6 +202,7 @@ function buildUserProfilePayload(user: AuthenticatedUser, settings: UserSettings
     email: user.email?.trim() || "",
     displayName,
     avatarUrl: settings.avatar_url,
+    backgroundTheme: settings.background_theme,
   };
 }
 
@@ -217,7 +261,7 @@ async function ensureUserSettingsRow(
 ): Promise<UserSettingsRow> {
   const { data, error } = await client.database
     .from("user_settings")
-    .select("user_id, display_name, avatar_url, onboarding_completed")
+    .select("user_id, display_name, avatar_url, onboarding_completed, background_theme")
     .eq("user_id", user.id)
     .maybeSingle();
 
@@ -237,9 +281,10 @@ async function ensureUserSettingsRow(
         user_id: user.id,
         display_name: inferredName,
         onboarding_completed: false,
+        background_theme: DEFAULT_USER_BACKGROUND_THEME,
       },
     ])
-    .select("user_id, display_name, avatar_url, onboarding_completed")
+    .select("user_id, display_name, avatar_url, onboarding_completed, background_theme")
     .single();
 
   if (insertError || !insertedData) {
@@ -330,19 +375,25 @@ export async function PATCH(request: Request): Promise<Response> {
     }
 
     const avatarUpdate = normalizeDiceBearAvatarUrl(payloadRecord.avatar_url);
+    const backgroundThemeUpdate = normalizeBackgroundTheme(payloadRecord.background_theme);
 
     if (avatarUpdate.error) {
       return jsonResponse({ error: avatarUpdate.error }, 400);
     }
 
-    if (!hasDisplayName && !avatarUpdate.isProvided) {
-      return jsonResponse({ error: "Debes enviar display_name y/o avatar_url." }, 400);
+    if (backgroundThemeUpdate.error) {
+      return jsonResponse({ error: backgroundThemeUpdate.error }, 400);
+    }
+
+    if (!hasDisplayName && !avatarUpdate.isProvided && !backgroundThemeUpdate.isProvided) {
+      return jsonResponse({ error: "Debes enviar display_name, avatar_url y/o background_theme." }, 400);
     }
 
     const settings = await ensureUserSettingsRow(client, user);
     const updates: {
       display_name?: string;
       avatar_url?: string | null;
+      background_theme?: UserBackgroundTheme;
     } = {};
 
     if (hasDisplayName && displayName) {
@@ -351,6 +402,10 @@ export async function PATCH(request: Request): Promise<Response> {
 
     if (avatarUpdate.isProvided) {
       updates.avatar_url = avatarUpdate.value;
+    }
+
+    if (backgroundThemeUpdate.isProvided) {
+      updates.background_theme = backgroundThemeUpdate.value;
     }
 
     const { error: updateError } = await client.database

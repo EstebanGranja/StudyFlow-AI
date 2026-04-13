@@ -1,4 +1,5 @@
 import { getAuthenticatedContext, jsonResponse } from "@/lib/insforge/server-auth";
+import { type StudyStatusPlanRow, resolveCurrentStudyStatusMap } from "@/lib/study-plans/current-study-status";
 
 export const runtime = "nodejs";
 
@@ -47,19 +48,46 @@ export async function GET(request: Request): Promise<Response> {
       return jsonResponse({ error: `No se pudo buscar usuarios: ${error.message}` }, 500);
     }
 
-    const users = ((data as UserPublicProfileRow[] | null) ?? [])
+    const filteredUsers = ((data as UserPublicProfileRow[] | null) ?? [])
       .filter((profile) => profile.user_id !== user.id)
       .filter(
         (profile) =>
           includesNormalized(profile.display_name, searchTerm) || includesNormalized(profile.email, searchTerm),
       )
       .sort((left, right) => left.display_name.localeCompare(right.display_name, "es", { sensitivity: "base" }))
-      .slice(0, 20)
+      .slice(0, 20);
+
+    const userIds = filteredUsers.map((profile) => profile.user_id);
+    let statusByUserId = new Map<string, { label: string }>();
+
+    if (userIds.length > 0) {
+      const referenceDate = new Date();
+      const startOfDayUtc = new Date(
+        Date.UTC(referenceDate.getUTCFullYear(), referenceDate.getUTCMonth(), referenceDate.getUTCDate()),
+      ).toISOString();
+
+      const { data: plansData, error: plansError } = await client.database
+        .from("study_plans")
+        .select("user_id, nombre, fecha_examen")
+        .in("user_id", userIds)
+        .not("fecha_examen", "is", null)
+        .gte("fecha_examen", startOfDayUtc)
+        .order("fecha_examen", { ascending: true });
+
+      if (plansError) {
+        return jsonResponse({ error: `No se pudieron cargar los estados de estudio: ${plansError.message}` }, 500);
+      }
+
+      statusByUserId = resolveCurrentStudyStatusMap((plansData as StudyStatusPlanRow[] | null) ?? []);
+    }
+
+    const users = filteredUsers
       .map((profile) => ({
         userId: profile.user_id,
         email: profile.email,
         displayName: profile.display_name,
         avatarUrl: profile.avatar_url,
+        studyStatusLabel: statusByUserId.get(profile.user_id)?.label ?? null,
       }));
 
     return jsonResponse({

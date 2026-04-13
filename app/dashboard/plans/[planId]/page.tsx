@@ -13,7 +13,14 @@ import {
 } from "react";
 import { FaFilePdf, FaGithub, FaGoogle, FaWikipediaW } from "react-icons/fa";
 import { FiExternalLink, FiLink } from "react-icons/fi";
+import { LoadingSpinner } from "@/components/loading-spinner";
 import { getInsforgeClient } from "@/lib/insforge/client";
+import {
+  DEFAULT_USER_BACKGROUND_THEME,
+  getUserBackgroundImagePath,
+  normalizeUserBackgroundTheme,
+  type UserBackgroundTheme,
+} from "@/lib/user-background-theme";
 
 type StudyPlan = {
   id: string;
@@ -39,6 +46,7 @@ type StudyDocument = {
 type UserSettings = {
   display_name: string | null;
   avatar_url: string | null;
+  background_theme: UserBackgroundTheme;
 };
 
 type StudyPlanLink = {
@@ -489,6 +497,8 @@ export default function StudyPlanDetailPage() {
   const [creatorAvatarUrl, setCreatorAvatarUrl] = useState<string | null>(null);
   const [planLinks, setPlanLinks] = useState<StudyPlanLink[]>([]);
   const [planLinksErrorMessage, setPlanLinksErrorMessage] = useState<string | null>(null);
+  const [backgroundTheme, setBackgroundTheme] = useState<UserBackgroundTheme>(DEFAULT_USER_BACKGROUND_THEME);
+  const [isBackgroundImageLoading, setIsBackgroundImageLoading] = useState(false);
   const [showAddLinkForm, setShowAddLinkForm] = useState(false);
   const [newLinkName, setNewLinkName] = useState("");
   const [newLinkUrl, setNewLinkUrl] = useState("");
@@ -643,21 +653,25 @@ export default function StudyPlanDetailPage() {
       const displayNameFallback = getDisplayNameFallback(currentUser);
       const { data: settingsData, error: settingsError } = await client.database
         .from("user_settings")
-        .select("display_name, avatar_url")
+        .select("display_name, avatar_url, background_theme")
         .eq("user_id", userId)
         .maybeSingle();
 
-      const settingsRow = settingsData as UserSettings | null;
+      const settingsRow = settingsData as Partial<UserSettings> | null;
       const resolvedDisplayName =
         !settingsError && settingsRow?.display_name?.trim()
           ? settingsRow.display_name.trim()
           : displayNameFallback;
 
       const resolvedAvatarUrl = !settingsError && settingsRow?.avatar_url ? settingsRow.avatar_url : null;
+      const resolvedBackgroundTheme = normalizeUserBackgroundTheme(
+        !settingsError ? settingsRow?.background_theme : null,
+      );
 
       if (!isCancelled) {
         setCreatorDisplayName(resolvedDisplayName);
         setCreatorAvatarUrl(resolvedAvatarUrl);
+        setBackgroundTheme(resolvedBackgroundTheme);
       }
 
       const { data: planData, error: planError } = await client.database
@@ -1202,10 +1216,41 @@ export default function StudyPlanDetailPage() {
     void persistDocumentOrder(previousDocuments, reorderedDocuments);
   }
 
+  const activeBackgroundImagePath = getUserBackgroundImagePath(backgroundTheme);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    setIsBackgroundImageLoading(true);
+
+    const image = new Image();
+
+    image.onload = () => {
+      if (!isCancelled) {
+        setIsBackgroundImageLoading(false);
+      }
+    };
+
+    image.onerror = () => {
+      if (!isCancelled) {
+        setIsBackgroundImageLoading(false);
+      }
+    };
+
+    image.src = activeBackgroundImagePath;
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [activeBackgroundImagePath]);
+
   if (isLoading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-zinc-950 px-6 py-12">
-        <p className="text-sm text-zinc-300">Cargando plan...</p>
+        <div className="flex items-center gap-3">
+          <LoadingSpinner size="lg" />
+          <p className="text-sm text-zinc-300">Cargando plan...</p>
+        </div>
       </div>
     );
   }
@@ -1221,8 +1266,21 @@ export default function StudyPlanDetailPage() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 px-6 py-12 text-zinc-100">
-      <main className="mx-auto w-full max-w-4xl space-y-6">
+    <div className="relative min-h-screen overflow-hidden bg-zinc-950 px-6 py-12 text-zinc-100">
+      <div
+        className="absolute inset-0 bg-cover bg-center bg-no-repeat"
+        style={{ backgroundImage: `url('${activeBackgroundImagePath}')` }}
+        aria-hidden="true"
+      />
+      <div className="absolute inset-0 bg-black/55" aria-hidden="true" />
+
+      <main className="relative z-10 mx-auto w-full max-w-4xl space-y-6">
+        {isBackgroundImageLoading ? (
+          <div className="flex items-center gap-2 text-xs text-zinc-300">
+            <LoadingSpinner size="sm" className="border-zinc-500 border-t-teal-200" />
+            <span>Cargando fondo...</span>
+          </div>
+        ) : null}
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-8">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="min-w-0">
