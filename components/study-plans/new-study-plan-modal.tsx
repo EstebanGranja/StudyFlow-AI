@@ -13,18 +13,23 @@ export function NewStudyPlanModal({ isOpen, onClose }: NewStudyPlanModalProps) {
   const router = useRouter();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [nivel, setNivel] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const [fechaExamen, setFechaExamen] = useState("");
+  const [files, setFiles] = useState<File[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  const today = new Date();
+  const minExamDate = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(
+    today.getDate(),
+  ).padStart(2, "0")}`;
 
   useEffect(() => {
     if (!isOpen) {
       setTitle("");
       setDescription("");
-      setNivel("");
-      setFile(null);
+      setFechaExamen("");
+      setFiles([]);
       setErrorMessage(null);
       setSuccessMessage(null);
       setIsSubmitting(false);
@@ -40,8 +45,13 @@ export function NewStudyPlanModal({ isOpen, onClose }: NewStudyPlanModalProps) {
     setErrorMessage(null);
     setSuccessMessage(null);
 
-    if (!file) {
-      setErrorMessage("Debes seleccionar un archivo PDF.");
+    if (files.length === 0) {
+      setErrorMessage("Debes seleccionar al menos un archivo PDF.");
+      return;
+    }
+
+    if (fechaExamen && fechaExamen < minExamDate) {
+      setErrorMessage("La fecha de examen no puede ser anterior al dia actual.");
       return;
     }
 
@@ -51,11 +61,22 @@ export function NewStudyPlanModal({ isOpen, onClose }: NewStudyPlanModalProps) {
       const result = await createStudyPlan({
         title,
         description,
-        nivel,
-        file,
+        fechaExamen,
+        files,
       });
 
-      setSuccessMessage("Plan creado y PDF subido correctamente. Redirigiendo...");
+      const failedCount = result.failedFiles.length;
+
+      if (failedCount > 0) {
+        setSuccessMessage(
+          `Plan creado. ${result.documentIds.length} PDF(s) subido(s) y ${failedCount} pendiente(s) para reintentar. Redirigiendo...`,
+        );
+      } else {
+        setSuccessMessage(
+          `Plan creado y ${result.documentIds.length} PDF(s) subido(s) correctamente. Redirigiendo...`,
+        );
+      }
+
       router.push(`/dashboard/plans/${result.planId}`);
       router.refresh();
       onClose();
@@ -116,35 +137,44 @@ export function NewStudyPlanModal({ isOpen, onClose }: NewStudyPlanModalProps) {
           </div>
 
           <div>
-            <label htmlFor="plan-level" className="mb-2 block text-sm font-medium text-zinc-100">
-              Nivel (opcional)
+            <label htmlFor="plan-exam-date" className="mb-2 block text-sm font-medium text-zinc-100">
+              Fecha de examen (opcional)
             </label>
-            <select
-              id="plan-level"
-              value={nivel}
-              onChange={(event) => setNivel(event.target.value)}
+            <input
+              id="plan-exam-date"
+              type="date"
+              value={fechaExamen}
+              min={minExamDate}
+              onChange={(event) => setFechaExamen(event.target.value)}
               className="h-11 w-full rounded-xl border border-zinc-700 bg-zinc-950/80 px-4 text-sm text-zinc-100 outline-none ring-zinc-500 transition focus:ring-2"
-            >
-              <option value="">Selecciona nivel</option>
-              <option value="basico">Basico</option>
-              <option value="intermedio">Intermedio</option>
-              <option value="avanzado">Avanzado</option>
-            </select>
+            />
           </div>
 
           <div>
             <label htmlFor="plan-file" className="mb-2 block text-sm font-medium text-zinc-100">
-              PDF
+              PDFs
             </label>
             <input
               id="plan-file"
               type="file"
               accept="application/pdf"
+              multiple
               required
-              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+              onChange={(event) => {
+                const selectedFiles = Array.from(event.target.files ?? []);
+                setFiles(selectedFiles);
+              }}
               className="block w-full rounded-xl border border-zinc-700 bg-zinc-950/80 px-4 py-3 text-sm text-zinc-200 file:mr-4 file:rounded-lg file:border-0 file:bg-zinc-800 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-zinc-100 hover:file:bg-zinc-700"
             />
-            <p className="mt-2 text-xs text-zinc-400">Solo PDF. Se guardara el archivo y sus metadatos basicos.</p>
+            <p className="mt-2 text-xs text-zinc-400">
+              Puedes seleccionar varios PDFs. Cada documento tendra su propio progreso y sumara al progreso total.
+            </p>
+
+            {files.length > 0 ? (
+              <p className="mt-2 text-xs text-emerald-200">
+                {files.length} PDF(s) seleccionado(s): {files.map((currentFile) => currentFile.name).join(", ")}
+              </p>
+            ) : null}
           </div>
 
           {errorMessage ? (
@@ -171,7 +201,7 @@ export function NewStudyPlanModal({ isOpen, onClose }: NewStudyPlanModalProps) {
               disabled={isSubmitting}
               className="inline-flex h-10 items-center justify-center rounded-lg bg-teal-300 px-5 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {isSubmitting ? "Creando y subiendo PDF..." : "Crear plan"}
+              {isSubmitting ? "Creando y subiendo PDFs..." : "Crear plan"}
             </button>
           </div>
         </form>

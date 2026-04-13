@@ -106,3 +106,6 @@ Aplica en orden:
 - `insforge/sql/003_study_plans_metadata.sql`
 - `insforge/sql/004_document_processing_queue.sql` (legacy, no activo en modo simple)
 - `insforge/sql/005_study_documents_metadata.sql`
+- `insforge/sql/006_study_plans_exam_date.sql`
+- `insforge/sql/007_study_documents_progress.sql`
+- `insforge/sql/008_study_documents_display_order.sql`

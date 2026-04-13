@@ -2,14 +2,21 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import {
+  type ChangeEvent,
+  type KeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { getInsforgeClient } from "@/lib/insforge/client";
 
 type StudyPlan = {
   id: string;
   nombre: string;
   description: string | null;
-  nivel: string | null;
+  fecha_examen: string | null;
   status: "processing" | "done" | "error";
   created_at: string;
 };
@@ -21,36 +28,33 @@ type StudyDocument = {
   created_at: string;
   file_url: string;
   page_count: number | null;
+  pages_read: number | null;
+  display_order: number | null;
   file_size_bytes: number | null;
 };
 
-function formatStatus(status: StudyPlan["status"]) {
-  if (status === "processing") {
-    return "En revision";
-  }
+type UserSettings = {
+  display_name: string | null;
+};
 
-  if (status === "done") {
-    return "Listo";
-  }
+type ProcessDocumentResponse = {
+  success?: boolean;
+  message?: string;
+  error?: string;
+  document?: {
+    id: string;
+    studyPlanId: string | null;
+    status: "pending" | "processing" | "done" | "error";
+    fileName: string;
+    fileUrl: string;
+    pageCount: number | null;
+    displayOrder: number | null;
+    fileSizeBytes: number | null;
+    createdAt: string | null;
+  };
+};
 
-  return "Error";
-}
-
-function formatDocumentStatus(status: StudyDocument["status"]) {
-  if (status === "done") {
-    return "Disponible";
-  }
-
-  if (status === "processing") {
-    return "En revision";
-  }
-
-  if (status === "pending") {
-    return "Pendiente";
-  }
-
-  return "Error";
-}
+const SLIDER_DEBOUNCE_MS = 350;
 
 function formatBytes(bytes: number | null): string {
   if (!bytes || bytes <= 0) {
@@ -70,18 +74,378 @@ function formatBytes(bytes: number | null): string {
   return `${size.toFixed(decimalPlaces)} ${units[unitIndex]}`;
 }
 
+function formatExamDate(examDate: string | null): string {
+  if (!examDate) {
+    return "Sin definir";
+  }
+
+  const parsedDate = new Date(examDate);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return "Sin definir";
+  }
+
+  return new Intl.DateTimeFormat("es-AR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(parsedDate);
+}
+
+function formatCreatedByDate(value: string): string {
+  const parsedDate = new Date(value);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return "fecha no disponible";
+  }
+
+  return new Intl.DateTimeFormat("es-AR", {
+    day: "numeric",
+    month: "numeric",
+    year: "numeric",
+  }).format(parsedDate);
+}
+
+function getDisplayNameFallback(user: unknown): string {
+  if (!user || typeof user !== "object") {
+    return "Sin nombre";
+  }
+
+  const userData = user as {
+    email?: string | null;
+    profile?: {
+      name?: string | null;
+    } | null;
+  };
+
+  const profileName = userData.profile?.name?.trim();
+  if (profileName) {
+    return profileName;
+  }
+
+  const emailPrefix = userData.email?.split("@")[0]?.trim();
+  if (emailPrefix) {
+    return emailPrefix;
+  }
+
+  return "Sin nombre";
+}
+
+function getDocumentTotalPages(document: StudyDocument): number | null {
+  if (typeof document.page_count !== "number") {
+    return null;
+  }
+
+  if (!Number.isFinite(document.page_count) || document.page_count <= 0) {
+    return null;
+  }
+
+  return Math.trunc(document.page_count);
+}
+
+function clampPagesRead(value: number, document: StudyDocument): number {
+  const normalized = Number.isFinite(value) ? Math.trunc(value) : 0;
+  const nonNegative = Math.max(0, normalized);
+  const totalPages = getDocumentTotalPages(document);
+
+  if (totalPages === null) {
+    return nonNegative;
+  }
+
+  return Math.min(nonNegative, totalPages);
+}
+
+function getProgressPercent(pagesRead: number, totalPages: number | null): number | null {
+  if (!totalPages || totalPages <= 0) {
+    return null;
+  }
+
+  const rawPercent = Math.round((pagesRead / totalPages) * 100);
+  return Math.min(100, Math.max(0, rawPercent));
+}
+
+function getProgressGreen(progressPercent: number): string {
+  const normalized = Math.min(100, Math.max(0, progressPercent)) / 100;
+  const start = { r: 134, g: 239, b: 172 };
+  const end = { r: 34, g: 197, b: 94 };
+
+  const r = Math.round(start.r + (end.r - start.r) * normalized);
+  const g = Math.round(start.g + (end.g - start.g) * normalized);
+  const b = Math.round(start.b + (end.b - start.b) * normalized);
+
+  return `rgb(${r} ${g} ${b})`;
+}
+
+function buildSliderBackground(progressPercent: number): string {
+  const clampedPercent = Math.min(100, Math.max(0, progressPercent));
+  const filledColor = getProgressGreen(clampedPercent);
+
+  return `linear-gradient(90deg, ${filledColor} 0%, ${filledColor} ${clampedPercent}%, rgba(39, 39, 42, 0.9) ${clampedPercent}%, rgba(39, 39, 42, 0.9) 100%)`;
+}
+
+function getDaysUntilExam(examDate: string | null): number | null {
+  if (!examDate) {
+    return null;
+  }
+
+  const parsedDate = new Date(examDate);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return null;
+  }
+
+  const now = new Date();
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const examUtc = Date.UTC(parsedDate.getUTCFullYear(), parsedDate.getUTCMonth(), parsedDate.getUTCDate());
+
+  return Math.ceil((examUtc - todayUtc) / msPerDay);
+}
+
+function formatExamCountdown(examDate: string | null): {
+  message: string;
+  tone: "neutral" | "good" | "warning" | "danger";
+} {
+  const daysUntilExam = getDaysUntilExam(examDate);
+
+  if (daysUntilExam === null) {
+    return {
+      message: "Agrega la fecha de examen para activar el contador de dias.",
+      tone: "neutral",
+    };
+  }
+
+  if (daysUntilExam > 7) {
+    return {
+      message: `Faltan ${daysUntilExam} dias para el examen. Buen ritmo para sostener el avance.`,
+      tone: "good",
+    };
+  }
+
+  if (daysUntilExam > 1) {
+    return {
+      message: `Faltan ${daysUntilExam} dias para el examen. Es un gran momento para reforzar repasos.`,
+      tone: "warning",
+    };
+  }
+
+  if (daysUntilExam === 1) {
+    return {
+      message: "Falta 1 dia para el examen. Prioriza temas clave y descanso.",
+      tone: "danger",
+    };
+  }
+
+  if (daysUntilExam === 0) {
+    return {
+      message: "El examen es hoy. Enfoque en resumenes y confianza final.",
+      tone: "danger",
+    };
+  }
+
+  return {
+    message:
+      daysUntilExam === -1
+        ? "El examen fue ayer. Puedes ajustar la fecha para el proximo objetivo."
+        : `El examen fue hace ${Math.abs(daysUntilExam)} dias. Puedes definir una nueva fecha para seguir el plan.`,
+    tone: "neutral",
+  };
+}
+
+function getCountdownClasses(tone: "neutral" | "good" | "warning" | "danger"): string {
+  if (tone === "good") {
+    return "border-emerald-400/30 bg-emerald-500/10 text-emerald-100";
+  }
+
+  if (tone === "warning") {
+    return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  }
+
+  if (tone === "danger") {
+    return "border-red-400/30 bg-red-500/10 text-red-100";
+  }
+
+  return "border-zinc-700 bg-zinc-950 text-zinc-300";
+}
+
+function buildPdfPreviewUrl(fileUrl: string): string {
+  if (fileUrl.includes("#")) {
+    return fileUrl;
+  }
+
+  return `${fileUrl}#view=FitH&toolbar=0&navpanes=0`;
+}
+
+function sortDocumentsByDisplayOrder(documents: StudyDocument[]): StudyDocument[] {
+  return [...documents].sort((left, right) => {
+    const leftOrder = typeof left.display_order === "number" ? left.display_order : Number.MAX_SAFE_INTEGER;
+    const rightOrder = typeof right.display_order === "number" ? right.display_order : Number.MAX_SAFE_INTEGER;
+
+    if (leftOrder !== rightOrder) {
+      return leftOrder - rightOrder;
+    }
+
+    const leftTime = new Date(left.created_at).getTime();
+    const rightTime = new Date(right.created_at).getTime();
+
+    if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime)) {
+      return rightTime - leftTime;
+    }
+
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function reorderDocumentsByStep(
+  documents: StudyDocument[],
+  documentId: string,
+  direction: "up" | "down",
+): StudyDocument[] | null {
+  const currentIndex = documents.findIndex((document) => document.id === documentId);
+
+  if (currentIndex < 0) {
+    return null;
+  }
+
+  const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
+
+  if (targetIndex < 0 || targetIndex >= documents.length) {
+    return null;
+  }
+
+  const reorderedDocuments = [...documents];
+  const [movedDocument] = reorderedDocuments.splice(currentIndex, 1);
+  reorderedDocuments.splice(targetIndex, 0, movedDocument);
+
+  return reorderedDocuments.map((document, index) => ({
+    ...document,
+    display_order: index,
+  }));
+}
+
 export default function StudyPlanDetailPage() {
   const params = useParams<{ planId: string }>();
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [plan, setPlan] = useState<StudyPlan | null>(null);
+  const [creatorDisplayName, setCreatorDisplayName] = useState("Sin nombre");
   const [documents, setDocuments] = useState<StudyDocument[]>([]);
+  const [currentUserId, setCurrentUserId] = useState<string>("");
+  const [progressByDocumentId, setProgressByDocumentId] = useState<Record<string, number>>({});
+  const [manualInputByDocumentId, setManualInputByDocumentId] = useState<Record<string, string>>({});
+  const [savingByDocumentId, setSavingByDocumentId] = useState<Record<string, boolean>>({});
+  const [saveErrorByDocumentId, setSaveErrorByDocumentId] = useState<Record<string, string | null>>({});
+  const [previewDocumentId, setPreviewDocumentId] = useState<string | null>(null);
+  const [isAddingPdf, setIsAddingPdf] = useState(false);
+  const [uploadingPdfCount, setUploadingPdfCount] = useState(0);
+  const [addPdfMessage, setAddPdfMessage] = useState<string | null>(null);
+  const [addPdfErrorMessage, setAddPdfErrorMessage] = useState<string | null>(null);
+  const [isPersistingDocumentOrder, setIsPersistingDocumentOrder] = useState(false);
+  const [documentOrderErrorMessage, setDocumentOrderErrorMessage] = useState<string | null>(null);
+  const saveTimeoutByDocumentIdRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const addPdfInputRef = useRef<HTMLInputElement | null>(null);
+  const documentCardRefs = useRef<Record<string, HTMLElement | null>>({});
 
   const planId = useMemo(() => {
     const value = params?.planId;
     return typeof value === "string" ? value : "";
   }, [params]);
+
+  const examCountdown = useMemo(() => {
+    return formatExamCountdown(plan?.fecha_examen ?? null);
+  }, [plan?.fecha_examen]);
+
+  const planProgress = useMemo(() => {
+    let trackedDocuments = 0;
+    let pagesRead = 0;
+    let totalPages = 0;
+
+    for (const document of documents) {
+      const documentTotalPages = getDocumentTotalPages(document);
+
+      if (!documentTotalPages) {
+        continue;
+      }
+
+      trackedDocuments += 1;
+      totalPages += documentTotalPages;
+
+      const persistedPagesRead = clampPagesRead(document.pages_read ?? 0, document);
+      const currentPagesRead = progressByDocumentId[document.id] ?? persistedPagesRead;
+      pagesRead += Math.min(currentPagesRead, documentTotalPages);
+    }
+
+    const progressPercent = totalPages > 0 ? Math.round((pagesRead / totalPages) * 100) : null;
+
+    return {
+      trackedDocuments,
+      pagesRead,
+      totalPages,
+      progressPercent,
+    };
+  }, [documents, progressByDocumentId]);
+
+  function captureCardRectMap(): Record<string, DOMRect> {
+    const rectMap: Record<string, DOMRect> = {};
+
+    for (const [documentId, element] of Object.entries(documentCardRefs.current)) {
+      if (!element) {
+        continue;
+      }
+
+      rectMap[documentId] = element.getBoundingClientRect();
+    }
+
+    return rectMap;
+  }
+
+  function animateCardOrderTransition(previousRects: Record<string, DOMRect>): void {
+    requestAnimationFrame(() => {
+      for (const [documentId, previousRect] of Object.entries(previousRects)) {
+        const element = documentCardRefs.current[documentId];
+
+        if (!element) {
+          continue;
+        }
+
+        const nextRect = element.getBoundingClientRect();
+        const deltaY = previousRect.top - nextRect.top;
+
+        if (Math.abs(deltaY) < 1) {
+          continue;
+        }
+
+        element.style.transition = "none";
+        element.style.transform = `translateY(${deltaY}px)`;
+        element.style.willChange = "transform";
+
+        requestAnimationFrame(() => {
+          element.style.transition = "transform 260ms cubic-bezier(0.22, 1, 0.36, 1)";
+          element.style.transform = "translateY(0)";
+
+          const handleTransitionEnd = () => {
+            element.style.transition = "";
+            element.style.willChange = "";
+            element.removeEventListener("transitionend", handleTransitionEnd);
+          };
+
+          element.addEventListener("transitionend", handleTransitionEnd);
+        });
+      }
+    });
+  }
+
+  useEffect(() => {
+    const timeoutMap = saveTimeoutByDocumentIdRef.current;
+
+    return () => {
+      for (const timeout of Object.values(timeoutMap)) {
+        clearTimeout(timeout);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!planId) {
@@ -94,7 +458,8 @@ export default function StudyPlanDetailPage() {
       const client = getInsforgeClient();
 
       const { data: currentUserData, error: currentUserError } = await client.auth.getCurrentUser();
-      const userId = currentUserData?.user?.id;
+      const currentUser = currentUserData?.user;
+      const userId = currentUser?.id;
 
       if (currentUserError || !userId) {
         if (!isCancelled) {
@@ -103,9 +468,29 @@ export default function StudyPlanDetailPage() {
         return;
       }
 
+      if (!isCancelled) {
+        setCurrentUserId(userId);
+      }
+
+      const displayNameFallback = getDisplayNameFallback(currentUser);
+      const { data: settingsData, error: settingsError } = await client.database
+        .from("user_settings")
+        .select("display_name")
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      const resolvedDisplayName =
+        !settingsError && (settingsData as UserSettings | null)?.display_name?.trim()
+          ? (settingsData as UserSettings).display_name!.trim()
+          : displayNameFallback;
+
+      if (!isCancelled) {
+        setCreatorDisplayName(resolvedDisplayName);
+      }
+
       const { data: planData, error: planError } = await client.database
         .from("study_plans")
-        .select("id, nombre, description, nivel, status, created_at")
+        .select("id, nombre, description, fecha_examen, status, created_at")
         .eq("id", planId)
         .eq("user_id", userId)
         .maybeSingle();
@@ -118,22 +503,63 @@ export default function StudyPlanDetailPage() {
         return;
       }
 
-      const { data: docsData, error: docsError } = await client.database
+      let resolvedDocuments: StudyDocument[] = [];
+      let docsErrorMessage: string | null = null;
+
+      const docsWithOrderResult = await client.database
         .from("study_documents")
-        .select("id, nombre, status, created_at, file_url, page_count, file_size_bytes")
+        .select("id, nombre, status, created_at, file_url, page_count, pages_read, display_order, file_size_bytes")
         .eq("plan_id", planId)
         .eq("user_id", userId)
+        .order("display_order", { ascending: true })
         .order("created_at", { ascending: false });
+
+      if (docsWithOrderResult.error) {
+        const normalizedError = docsWithOrderResult.error.message.toLowerCase();
+        const displayOrderMissing =
+          normalizedError.includes("display_order") &&
+          (normalizedError.includes("does not exist") || normalizedError.includes("schema"));
+
+        if (displayOrderMissing) {
+          const fallbackDocsResult = await client.database
+            .from("study_documents")
+            .select("id, nombre, status, created_at, file_url, page_count, pages_read, file_size_bytes")
+            .eq("plan_id", planId)
+            .eq("user_id", userId)
+            .order("created_at", { ascending: false });
+
+          if (fallbackDocsResult.error) {
+            docsErrorMessage = fallbackDocsResult.error.message;
+          } else {
+            const fallbackDocuments =
+              ((fallbackDocsResult.data as Omit<StudyDocument, "display_order">[] | null) ?? []).map(
+                (document, index) => ({
+                  ...document,
+                  display_order: index,
+                }),
+              );
+
+            resolvedDocuments = fallbackDocuments;
+          }
+        } else {
+          docsErrorMessage = docsWithOrderResult.error.message;
+        }
+      } else {
+        resolvedDocuments = ((docsWithOrderResult.data as StudyDocument[] | null) ?? []).map((document, index) => ({
+          ...document,
+          display_order: typeof document.display_order === "number" ? Math.trunc(document.display_order) : index,
+        }));
+      }
 
       if (!isCancelled) {
         setPlan(planData as StudyPlan);
 
-        if (docsError) {
-          setErrorMessage(docsError.message);
+        if (docsErrorMessage) {
+          setErrorMessage(docsErrorMessage);
           setDocuments([]);
         } else {
           setErrorMessage(null);
-          setDocuments((docsData as StudyDocument[]) ?? []);
+          setDocuments(sortDocumentsByDisplayOrder(resolvedDocuments));
         }
 
         setIsLoading(false);
@@ -146,6 +572,375 @@ export default function StudyPlanDetailPage() {
       isCancelled = true;
     };
   }, [planId, router]);
+
+  useEffect(() => {
+    setProgressByDocumentId((previousState) => {
+      const nextState: Record<string, number> = {};
+
+      for (const document of documents) {
+        const persistedValue = clampPagesRead(document.pages_read ?? 0, document);
+        const previousValue = previousState[document.id];
+
+        nextState[document.id] =
+          typeof previousValue === "number" ? clampPagesRead(previousValue, document) : persistedValue;
+      }
+
+      return nextState;
+    });
+
+    setManualInputByDocumentId((previousState) => {
+      const nextState: Record<string, string> = {};
+
+      for (const document of documents) {
+        const pagesRead = clampPagesRead(document.pages_read ?? 0, document);
+        const previousValue = previousState[document.id];
+        nextState[document.id] = typeof previousValue === "string" ? previousValue : String(pagesRead);
+      }
+
+      return nextState;
+    });
+
+    setPreviewDocumentId((currentPreviewId) => {
+      if (documents.length === 0) {
+        return null;
+      }
+
+      if (currentPreviewId && documents.some((document) => document.id === currentPreviewId)) {
+        return currentPreviewId;
+      }
+
+      return documents[0]?.id ?? null;
+    });
+
+    const validDocumentIds = new Set(documents.map((document) => document.id));
+
+    for (const documentId of Object.keys(documentCardRefs.current)) {
+      if (!validDocumentIds.has(documentId)) {
+        delete documentCardRefs.current[documentId];
+      }
+    }
+  }, [documents]);
+
+  async function persistDocumentProgress(document: StudyDocument, nextPagesRead: number): Promise<void> {
+    if (!currentUserId) {
+      return;
+    }
+
+    const client = getInsforgeClient();
+
+    setSavingByDocumentId((previousState) => ({
+      ...previousState,
+      [document.id]: true,
+    }));
+
+    setSaveErrorByDocumentId((previousState) => ({
+      ...previousState,
+      [document.id]: null,
+    }));
+
+    try {
+      const { error } = await client.database
+        .from("study_documents")
+        .update({ pages_read: nextPagesRead })
+        .eq("id", document.id)
+        .eq("plan_id", planId)
+        .eq("user_id", currentUserId);
+
+      if (error) {
+        setSaveErrorByDocumentId((previousState) => ({
+          ...previousState,
+          [document.id]: error.message || "No se pudo guardar el avance.",
+        }));
+        return;
+      }
+
+      setDocuments((previousDocuments) =>
+        previousDocuments.map((currentDocument) =>
+          currentDocument.id === document.id
+            ? {
+                ...currentDocument,
+                pages_read: nextPagesRead,
+              }
+            : currentDocument,
+        ),
+      );
+    } finally {
+      setSavingByDocumentId((previousState) => ({
+        ...previousState,
+        [document.id]: false,
+      }));
+    }
+  }
+
+  function scheduleProgressSave(document: StudyDocument, nextPagesRead: number): void {
+    const currentTimeout = saveTimeoutByDocumentIdRef.current[document.id];
+
+    if (currentTimeout) {
+      clearTimeout(currentTimeout);
+    }
+
+    saveTimeoutByDocumentIdRef.current[document.id] = setTimeout(() => {
+      delete saveTimeoutByDocumentIdRef.current[document.id];
+      void persistDocumentProgress(document, nextPagesRead);
+    }, SLIDER_DEBOUNCE_MS);
+  }
+
+  function handleSliderChange(document: StudyDocument, event: ChangeEvent<HTMLInputElement>): void {
+    const rawValue = Number(event.target.value);
+    const nextPagesRead = clampPagesRead(rawValue, document);
+
+    setProgressByDocumentId((previousState) => ({
+      ...previousState,
+      [document.id]: nextPagesRead,
+    }));
+
+    setManualInputByDocumentId((previousState) => ({
+      ...previousState,
+      [document.id]: String(nextPagesRead),
+    }));
+
+    scheduleProgressSave(document, nextPagesRead);
+  }
+
+  function handleManualInputChange(documentId: string, rawValue: string): void {
+    setManualInputByDocumentId((previousState) => ({
+      ...previousState,
+      [documentId]: rawValue,
+    }));
+  }
+
+  function commitManualInput(document: StudyDocument): void {
+    const rawValue = manualInputByDocumentId[document.id] ?? "0";
+    const parsedValue = Number(rawValue);
+    const nextPagesRead = clampPagesRead(parsedValue, document);
+
+    const currentTimeout = saveTimeoutByDocumentIdRef.current[document.id];
+
+    if (currentTimeout) {
+      clearTimeout(currentTimeout);
+      delete saveTimeoutByDocumentIdRef.current[document.id];
+    }
+
+    setProgressByDocumentId((previousState) => ({
+      ...previousState,
+      [document.id]: nextPagesRead,
+    }));
+
+    setManualInputByDocumentId((previousState) => ({
+      ...previousState,
+      [document.id]: String(nextPagesRead),
+    }));
+
+    void persistDocumentProgress(document, nextPagesRead);
+  }
+
+  function handleManualInputKeyDown(event: KeyboardEvent<HTMLInputElement>, document: StudyDocument): void {
+    if (event.key !== "Enter") {
+      return;
+    }
+
+    event.preventDefault();
+    commitManualInput(document);
+  }
+
+  function getAuthHeaderForApiRequest(): string {
+    const client = getInsforgeClient();
+    const headers = client.getHttpClient().getHeaders();
+    const token = headers.Authorization ?? headers.authorization;
+
+    if (!token) {
+      throw new Error("No hay sesion activa para subir PDFs.");
+    }
+
+    return token;
+  }
+
+  function getApiProcessError(payload: ProcessDocumentResponse | null): string {
+    const rawError = payload?.error;
+
+    if (typeof rawError === "string") {
+      const normalized = rawError.trim();
+
+      if (normalized.length > 0) {
+        return normalized;
+      }
+    }
+
+    return "No se pudo subir el PDF.";
+  }
+
+  async function uploadSinglePdf(file: File, authorization: string): Promise<StudyDocument> {
+    const formData = new FormData();
+    formData.append("studyPlanId", planId);
+    formData.append("file", file, file.name);
+
+    const response = await fetch("/api/process-document", {
+      method: "POST",
+      headers: {
+        Authorization: authorization,
+      },
+      body: formData,
+    });
+
+    const payload = (await response.json().catch(() => null)) as ProcessDocumentResponse | null;
+
+    if (!response.ok) {
+      throw new Error(getApiProcessError(payload));
+    }
+
+    if (!payload?.document?.id) {
+      throw new Error("La API no devolvio el documento creado.");
+    }
+
+    return {
+      id: payload.document.id,
+      nombre: payload.document.fileName,
+      status: payload.document.status,
+      created_at: payload.document.createdAt ?? new Date().toISOString(),
+      file_url: payload.document.fileUrl,
+      page_count: payload.document.pageCount,
+      pages_read: 0,
+      display_order:
+        typeof payload.document.displayOrder === "number" && Number.isFinite(payload.document.displayOrder)
+          ? Math.trunc(payload.document.displayOrder)
+          : null,
+      file_size_bytes: payload.document.fileSizeBytes,
+    };
+  }
+
+  async function handleAddPdfChange(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    const selectedFiles = Array.from(event.target.files ?? []);
+    event.target.value = "";
+
+    if (selectedFiles.length === 0) {
+      return;
+    }
+
+    const hasInvalidFile = selectedFiles.some((file) => {
+      const normalizedName = file.name.toLowerCase();
+      return file.type !== "application/pdf" && !normalizedName.endsWith(".pdf");
+    });
+
+    if (hasInvalidFile) {
+      setAddPdfErrorMessage("Solo puedes subir archivos PDF.");
+      setAddPdfMessage(null);
+      return;
+    }
+
+    setIsAddingPdf(true);
+    setUploadingPdfCount(selectedFiles.length);
+    setAddPdfMessage(null);
+    setAddPdfErrorMessage(null);
+
+    const successfulDocuments: StudyDocument[] = [];
+    const failedFiles: string[] = [];
+
+    try {
+      const authorization = getAuthHeaderForApiRequest();
+
+      for (const file of selectedFiles) {
+        try {
+          const createdDocument = await uploadSinglePdf(file, authorization);
+          successfulDocuments.push(createdDocument);
+        } catch {
+          failedFiles.push(file.name);
+        }
+      }
+
+      if (successfulDocuments.length > 0) {
+        setDocuments((previousDocuments) => {
+          const mergedDocuments = [...previousDocuments, ...successfulDocuments];
+          return sortDocumentsByDisplayOrder(mergedDocuments);
+        });
+        setPreviewDocumentId(successfulDocuments[0]?.id ?? null);
+      }
+
+      if (failedFiles.length > 0) {
+        setAddPdfErrorMessage(
+          `No se pudieron subir ${failedFiles.length} archivo(s): ${failedFiles.join(", ")}. Reintenta esos documentos.`,
+        );
+      }
+
+      if (successfulDocuments.length > 0) {
+        setAddPdfMessage(
+          `Se agregaron ${successfulDocuments.length} PDF(s) al plan. Cada uno ya cuenta para el progreso total.`,
+        );
+      }
+
+      if (successfulDocuments.length === 0 && failedFiles.length === 0) {
+        setAddPdfErrorMessage("No se seleccionaron PDFs para subir.");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "No se pudieron agregar PDFs al plan.";
+      setAddPdfErrorMessage(message);
+    } finally {
+      setIsAddingPdf(false);
+      setUploadingPdfCount(0);
+    }
+  }
+
+  async function persistDocumentOrder(
+    previousDocuments: StudyDocument[],
+    orderedDocuments: StudyDocument[],
+  ): Promise<void> {
+    if (!currentUserId) {
+      return;
+    }
+
+    const previousIndexByDocumentId = new Map(previousDocuments.map((document, index) => [document.id, index]));
+    const client = getInsforgeClient();
+
+    setIsPersistingDocumentOrder(true);
+    setDocumentOrderErrorMessage(null);
+
+    try {
+      for (let index = 0; index < orderedDocuments.length; index += 1) {
+        const document = orderedDocuments[index];
+        const previousIndex = previousIndexByDocumentId.get(document.id);
+
+        if (previousIndex === index) {
+          continue;
+        }
+
+        const { error } = await client.database
+          .from("study_documents")
+          .update({ display_order: index })
+          .eq("id", document.id)
+          .eq("plan_id", planId)
+          .eq("user_id", currentUserId);
+
+        if (error) {
+          throw new Error(error.message || "No se pudo guardar el nuevo orden de documentos.");
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "No se pudo guardar el nuevo orden de documentos.";
+      setDocumentOrderErrorMessage(`${message} Se restauro el orden anterior.`);
+      setDocuments(previousDocuments);
+    } finally {
+      setIsPersistingDocumentOrder(false);
+    }
+  }
+
+  function handleMoveDocument(documentId: string, direction: "up" | "down"): void {
+    if (isPersistingDocumentOrder) {
+      return;
+    }
+
+    const previousDocuments = documents.map((document) => ({ ...document }));
+    const reorderedDocuments = reorderDocumentsByStep(documents, documentId, direction);
+
+    if (!reorderedDocuments) {
+      return;
+    }
+
+    const previousRects = captureCardRectMap();
+
+    setDocumentOrderErrorMessage(null);
+    setDocuments(reorderedDocuments);
+    animateCardOrderTransition(previousRects);
+    void persistDocumentOrder(previousDocuments, reorderedDocuments);
+  }
 
   if (isLoading) {
     return (
@@ -173,7 +968,10 @@ export default function StudyPlanDetailPage() {
             <div>
               <p className="text-sm uppercase tracking-[0.14em] text-teal-300">Plan de estudio</p>
               <h1 className="mt-2 text-3xl font-semibold text-white">{plan.nombre}</h1>
-              <p className="mt-3 text-sm text-zinc-300">Estado: {formatStatus(plan.status)}</p>
+              <p className="mt-3 text-sm text-zinc-300">
+                Creado por: <span className="font-semibold text-zinc-100">{creatorDisplayName}</span> el{" "}
+                {formatCreatedByDate(plan.created_at)}
+              </p>
             </div>
             <Link
               href="/dashboard"
@@ -187,11 +985,38 @@ export default function StudyPlanDetailPage() {
 
           <div className="mt-6 flex flex-wrap gap-3 text-xs">
             <span className="rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1 text-zinc-300">
-              Nivel: {plan.nivel ?? "Sin definir"}
+              Examen: {formatExamDate(plan.fecha_examen)}
             </span>
-            <span className="rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1 text-zinc-300">
-              Creado: {new Date(plan.created_at).toLocaleString()}
-            </span>
+          </div>
+
+          <div className="mt-5 rounded-xl border border-emerald-400/25 bg-emerald-500/5 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm font-semibold text-emerald-100">Progreso total del plan</p>
+              <p className="text-xs text-emerald-200">
+                {planProgress.progressPercent ?? "--"}% · {planProgress.pagesRead}/
+                {planProgress.totalPages > 0 ? planProgress.totalPages : "N/A"} pags
+              </p>
+            </div>
+
+            <div className="mt-3 h-3 overflow-hidden rounded-full bg-zinc-800">
+              <div
+                className="h-full rounded-full transition-all duration-300"
+                style={{
+                  width: `${planProgress.progressPercent ?? 0}%`,
+                  backgroundColor: getProgressGreen(planProgress.progressPercent ?? 0),
+                }}
+              />
+            </div>
+
+            <p className="mt-2 text-xs text-zinc-300">
+              {planProgress.trackedDocuments > 0
+                ? `Se calcula con ${planProgress.trackedDocuments} documento(s) que tienen cantidad total de paginas.`
+                : "El progreso total aparecera cuando haya documentos con cantidad de paginas detectada."}
+            </p>
+          </div>
+
+          <div className={`mt-4 rounded-xl border px-4 py-3 text-sm ${getCountdownClasses(examCountdown.tone)}`}>
+            {examCountdown.message}
           </div>
         </section>
 
@@ -204,36 +1029,236 @@ export default function StudyPlanDetailPage() {
             </p>
           ) : null}
 
+          {isPersistingDocumentOrder ? (
+            <p className="mt-4 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+              Guardando nuevo orden de documentos...
+            </p>
+          ) : null}
+
+          {documentOrderErrorMessage ? (
+            <p className="mt-4 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+              {documentOrderErrorMessage}
+            </p>
+          ) : null}
+
           {documents.length === 0 ? (
             <p className="mt-4 text-sm text-zinc-400">Aun no hay documentos en este plan.</p>
           ) : (
-            <div className="mt-4 space-y-3">
-              {documents.map((document) => (
-                <article key={document.id} className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium text-zinc-100">{document.nombre}</p>
-                      <p className="text-xs text-zinc-400">
-                        Estado: {formatDocumentStatus(document.status)} · {new Date(document.created_at).toLocaleString()}
-                      </p>
-                      <p className="text-xs text-zinc-500">
-                        Paginas: {document.page_count ?? "N/A"} · Peso: {formatBytes(document.file_size_bytes)}
-                      </p>
+            <div className="mt-4 space-y-4">
+              {documents.map((document, documentIndex) => {
+                const totalPages = getDocumentTotalPages(document);
+                const persistedPagesRead = clampPagesRead(document.pages_read ?? 0, document);
+                const pagesRead = progressByDocumentId[document.id] ?? persistedPagesRead;
+                const progressPercent = getProgressPercent(pagesRead, totalPages) ?? 0;
+                const sliderMax = totalPages ?? Math.max(1, pagesRead);
+                const sliderBackground = buildSliderBackground(progressPercent);
+                const isPreviewVisible = previewDocumentId === document.id;
+                const isSaving = savingByDocumentId[document.id] ?? false;
+                const saveError = saveErrorByDocumentId[document.id];
+                const isFirstDocument = documentIndex === 0;
+                const isLastDocument = documentIndex === documents.length - 1;
+
+                return (
+                  <article
+                    key={document.id}
+                    ref={(element) => {
+                      documentCardRefs.current[document.id] = element;
+                    }}
+                    className="rounded-2xl border border-zinc-700/80 bg-zinc-950/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] transition-colors duration-200"
+                  >
+                    <div className="rounded-xl border border-zinc-800/80 bg-zinc-900/40 px-4 py-4">
+                      <div className="mb-3 flex items-center justify-center gap-2 text-[11px] uppercase tracking-[0.1em] text-zinc-400">
+                        <span>Desplazar</span>
+                        <button
+                          type="button"
+                          aria-label={`Subir ${document.nombre}`}
+                          disabled={isPersistingDocumentOrder || isFirstDocument}
+                          onClick={() => handleMoveDocument(document.id, "up")}
+                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-sm font-bold text-zinc-300 transition hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-600"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Bajar ${document.nombre}`}
+                          disabled={isPersistingDocumentOrder || isLastDocument}
+                          onClick={() => handleMoveDocument(document.id, "down")}
+                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-sm font-bold text-zinc-300 transition hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-600"
+                        >
+                          ↓
+                        </button>
+                      </div>
+
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="space-y-2">
+                          <p className="text-lg font-semibold tracking-[0.01em] text-zinc-100">{document.nombre}</p>
+                          <div className="h-[2px] w-52 max-w-full bg-gradient-to-r from-emerald-300/70 via-emerald-200/30 to-transparent" />
+                          <p className="text-xs text-zinc-500">
+                            Paginas: {document.page_count ?? "N/A"} · Peso: {formatBytes(document.file_size_bytes)}
+                          </p>
+                        </div>
+
+                        <a
+                          href={document.file_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex h-10 items-center justify-center rounded-lg bg-teal-300 px-4 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200"
+                        >
+                          Abrir PDF
+                        </a>
+                      </div>
                     </div>
 
-                    <a
-                      href={document.file_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex h-10 items-center justify-center rounded-lg bg-teal-300 px-4 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200"
-                    >
-                      Abrir PDF
-                    </a>
-                  </div>
-                </article>
-              ))}
+                    <div className="mt-4 rounded-xl border border-emerald-400/25 bg-emerald-500/10 p-4">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-xs uppercase tracking-[0.1em] text-emerald-200">Avance de lectura</p>
+                        <p className="text-[11px] text-emerald-100">{isSaving ? "Guardando..." : "Guardado"}</p>
+                      </div>
+
+                      <div className="mt-3 flex flex-col gap-3 lg:flex-row lg:items-center">
+                        <div className="min-w-0 flex-1">
+                          <input
+                            type="range"
+                            min={0}
+                            max={sliderMax}
+                            value={Math.min(pagesRead, sliderMax)}
+                            disabled={totalPages === null}
+                            onChange={(event) => handleSliderChange(document, event)}
+                            className="h-2 w-full cursor-pointer appearance-none rounded-full bg-zinc-800 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border [&::-webkit-slider-thumb]:border-emerald-200/80 [&::-webkit-slider-thumb]:bg-emerald-400 [&::-webkit-slider-thumb]:shadow-[0_0_0_4px_rgba(16,185,129,0.18)] [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border [&::-moz-range-thumb]:border-emerald-200/80 [&::-moz-range-thumb]:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+                            style={{ background: sliderBackground }}
+                            aria-label={`Progreso de lectura ${document.nombre}`}
+                          />
+
+                          {totalPages === null ? (
+                            <p className="mt-2 text-[11px] text-zinc-400">
+                              No se detecto el total de paginas de este PDF. Puedes usar el campo manual para guardar tu
+                              avance.
+                            </p>
+                          ) : null}
+                        </div>
+
+                        <div className="flex items-center gap-3 rounded-lg border border-emerald-300/25 bg-zinc-950/60 px-3 py-2">
+                          <p className="text-sm font-semibold text-emerald-100">
+                            {totalPages === null ? "--" : `${progressPercent}%`}
+                          </p>
+                          <p className="text-xs text-emerald-200">
+                            {pagesRead}/{totalPages ?? "N/A"} pags
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <label
+                          htmlFor={`manual-pages-${document.id}`}
+                          className="text-xs uppercase tracking-[0.08em] text-emerald-200"
+                        >
+                          Pagina actual
+                        </label>
+                        <input
+                          id={`manual-pages-${document.id}`}
+                          type="number"
+                          inputMode="numeric"
+                          min={0}
+                          max={totalPages ?? undefined}
+                          value={manualInputByDocumentId[document.id] ?? String(pagesRead)}
+                          onChange={(event) => handleManualInputChange(document.id, event.target.value)}
+                          onBlur={() => commitManualInput(document)}
+                          onKeyDown={(event) => handleManualInputKeyDown(event, document)}
+                          className="h-9 w-28 rounded-lg border border-emerald-300/30 bg-zinc-950 px-3 text-sm text-zinc-100 outline-none transition focus:border-emerald-300 focus:ring-2 focus:ring-emerald-300/20"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => commitManualInput(document)}
+                          className="inline-flex h-9 items-center justify-center rounded-lg border border-emerald-300/30 bg-emerald-500/15 px-3 text-xs font-semibold text-emerald-100 transition hover:bg-emerald-500/25"
+                        >
+                          Guardar pagina
+                        </button>
+                      </div>
+
+                      {saveError ? (
+                        <p className="mt-3 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+                          {saveError}
+                        </p>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/60 p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <p className="text-xs uppercase tracking-[0.1em] text-zinc-400">Vista previa del PDF</p>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPreviewDocumentId((currentId) => (currentId === document.id ? null : document.id))
+                          }
+                          className="inline-flex h-8 items-center justify-center rounded-lg border border-zinc-700 px-3 text-xs font-semibold text-zinc-200 transition hover:border-zinc-500 hover:bg-zinc-800"
+                        >
+                          {isPreviewVisible ? "Ocultar vista previa" : "Ver vista previa"}
+                        </button>
+                      </div>
+
+                      {isPreviewVisible ? (
+                        <div className="mt-3 overflow-hidden rounded-lg border border-zinc-800 bg-black">
+                          <iframe
+                            src={buildPdfPreviewUrl(document.file_url)}
+                            title={`Vista previa de ${document.nombre}`}
+                            className="h-[460px] w-full"
+                          />
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-xs text-zinc-500">
+                          Activa la vista previa para revisar el PDF sin salir de esta pantalla.
+                        </p>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           )}
+
+          <div className="mt-6 rounded-xl border border-zinc-700 bg-zinc-950/70 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-zinc-100">Agregar PDF</p>
+                <p className="mt-1 text-xs text-zinc-400">
+                  Sube uno o varios PDFs para sumarlos al plan. Cada documento tendra su progreso propio.
+                </p>
+              </div>
+
+              <input
+                ref={addPdfInputRef}
+                type="file"
+                accept="application/pdf"
+                multiple
+                disabled={isAddingPdf}
+                onChange={(event) => {
+                  void handleAddPdfChange(event);
+                }}
+                className="hidden"
+              />
+
+              <button
+                type="button"
+                disabled={isAddingPdf}
+                onClick={() => addPdfInputRef.current?.click()}
+                className="inline-flex h-10 items-center justify-center rounded-lg bg-teal-300 px-4 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isAddingPdf ? `Subiendo ${uploadingPdfCount} PDF(s)...` : "Agregar PDF"}
+              </button>
+            </div>
+
+            {addPdfMessage ? (
+              <p className="mt-3 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+                {addPdfMessage}
+              </p>
+            ) : null}
+
+            {addPdfErrorMessage ? (
+              <p className="mt-3 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                {addPdfErrorMessage}
+              </p>
+            ) : null}
+          </div>
         </section>
       </main>
     </div>

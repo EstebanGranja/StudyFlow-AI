@@ -1,16 +1,18 @@
 import { getInsforgeClient } from "@/lib/insforge/client";
-import type { StudyPlanStatus } from "@/lib/insforge/study.types";
+
+type StudyPlanStatus = "processing" | "done" | "error";
 
 type CreateStudyPlanInput = {
   title: string;
   description?: string;
-  nivel?: string;
-  file: File;
+  fechaExamen?: string;
+  files: File[];
 };
 
 type CreateStudyPlanResult = {
   planId: string;
-  documentId: string;
+  documentIds: string[];
+  failedFiles: string[];
 };
 
 type ProcessDocumentResponse = {
@@ -105,6 +107,20 @@ function normalizeOptionalText(value: string | undefined): string | null {
   return normalized.length > 0 ? normalized : null;
 }
 
+function normalizeOptionalExamDate(value: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return null;
+  }
+
+  return `${normalized}T00:00:00.000Z`;
+}
+
 function toUserFriendlyProcessError(message: string): string {
   return message;
 }
@@ -141,14 +157,14 @@ export async function createStudyPlan(input: CreateStudyPlanInput): Promise<Crea
   const operationId = buildOperationId();
   const startedAt = Date.now();
   let createdPlanId: string | null = null;
+  const normalizedFiles = input.files.filter((currentFile) => currentFile instanceof File);
 
   logCreateStudyPlanInfo(operationId, "Inicio de creacion de study plan", {
     titleLength: input.title.trim().length,
     hasDescription: Boolean(normalizeOptionalText(input.description)),
-    nivel: normalizeOptionalText(input.nivel),
-    fileName: input.file?.name ?? null,
-    fileType: input.file?.type ?? null,
-    fileBytes: input.file?.size ?? null,
+    fechaExamen: normalizeOptionalExamDate(input.fechaExamen),
+    totalFiles: normalizedFiles.length,
+    fileNames: normalizedFiles.map((currentFile) => currentFile.name),
   });
 
   const client = getInsforgeClient();
@@ -173,9 +189,18 @@ export async function createStudyPlan(input: CreateStudyPlanInput): Promise<Crea
     throw new Error("El titulo del plan es obligatorio.");
   }
 
-  if (!input.file) {
+  if (normalizedFiles.length === 0) {
     logCreateStudyPlanWarn(operationId, "Validacion fallida: PDF no seleccionado");
-    throw new Error("Debes seleccionar un PDF.");
+    throw new Error("Debes seleccionar al menos un PDF.");
+  }
+
+  const hasInvalidFileType = normalizedFiles.some((currentFile) => {
+    const normalizedName = currentFile.name.toLowerCase();
+    return currentFile.type !== "application/pdf" && !normalizedName.endsWith(".pdf");
+  });
+
+  if (hasInvalidFileType) {
+    throw new Error("Solo se permiten archivos PDF.");
   }
 
   logCreateStudyPlanInfo(operationId, "Creando study plan en base de datos", {
@@ -190,7 +215,7 @@ export async function createStudyPlan(input: CreateStudyPlanInput): Promise<Crea
         user_id: userId,
         nombre: title,
         description: normalizeOptionalText(input.description),
-        nivel: normalizeOptionalText(input.nivel),
+        fecha_examen: normalizeOptionalExamDate(input.fechaExamen),
         status: "processing" as const,
       },
     ])
@@ -208,63 +233,93 @@ export async function createStudyPlan(input: CreateStudyPlanInput): Promise<Crea
 
   const planId = createdPlan.id as string;
   createdPlanId = planId;
+  const createdDocumentIds: string[] = [];
+  const failedFiles: string[] = [];
 
   logCreateStudyPlanInfo(operationId, "Study plan creado", {
     planId,
   });
 
   try {
-    const formData = new FormData();
-    formData.append("studyPlanId", planId);
-    formData.append("file", input.file, input.file.name);
+    const authHeader = getAuthHeader();
 
-    logCreateStudyPlanInfo(operationId, "Enviando PDF a /api/process-document", {
-      planId,
-      fileName: input.file.name,
-      fileBytes: input.file.size,
-    });
+    for (const currentFile of normalizedFiles) {
+      const formData = new FormData();
+      formData.append("studyPlanId", planId);
+      formData.append("file", currentFile, currentFile.name);
 
-    const response = await fetch("/api/process-document", {
-      method: "POST",
-      headers: {
-        Authorization: getAuthHeader(),
-      },
-      body: formData,
-    });
+      logCreateStudyPlanInfo(operationId, "Enviando PDF a /api/process-document", {
+        planId,
+        fileName: currentFile.name,
+        fileBytes: currentFile.size,
+      });
 
-    const payload = (await response.json().catch(() => null)) as ProcessDocumentResponse | null;
+      try {
+        const response = await fetch("/api/process-document", {
+          method: "POST",
+          headers: {
+            Authorization: authHeader,
+          },
+          body: formData,
+        });
 
-    logCreateStudyPlanInfo(operationId, "Respuesta recibida desde /api/process-document", {
-      planId,
-      ok: response.ok,
-      status: response.status,
-      mode: payload?.mode ?? null,
-      documentId: payload?.document?.id ?? null,
-      documentStatus: payload?.document?.status ?? null,
-      pageCount: payload?.document?.pageCount ?? null,
-      fileSizeBytes: payload?.document?.fileSizeBytes ?? null,
-      apiError: payload?.error ?? null,
-    });
+        const payload = (await response.json().catch(() => null)) as ProcessDocumentResponse | null;
 
-    if (!response.ok) {
-      throw new Error(toUserFriendlyProcessError(getApiProcessError(payload)));
+        logCreateStudyPlanInfo(operationId, "Respuesta recibida desde /api/process-document", {
+          planId,
+          ok: response.ok,
+          status: response.status,
+          mode: payload?.mode ?? null,
+          documentId: payload?.document?.id ?? null,
+          documentStatus: payload?.document?.status ?? null,
+          pageCount: payload?.document?.pageCount ?? null,
+          fileSizeBytes: payload?.document?.fileSizeBytes ?? null,
+          apiError: payload?.error ?? null,
+        });
+
+        if (!response.ok) {
+          throw new Error(toUserFriendlyProcessError(getApiProcessError(payload)));
+        }
+
+        if (!payload?.document?.id) {
+          throw new Error("La API no devolvio documentId.");
+        }
+
+        createdDocumentIds.push(payload.document.id);
+      } catch (error) {
+        failedFiles.push(currentFile.name);
+        logCreateStudyPlanWarn(operationId, "No se pudo subir uno de los PDFs", {
+          planId,
+          fileName: currentFile.name,
+          error: serializeError(error),
+        });
+      }
     }
 
-    if (!payload?.document?.id) {
-      throw new Error("La API no devolvio documentId.");
+    if (createdDocumentIds.length === 0) {
+      throw new Error("No se pudo subir ninguno de los PDFs seleccionados.");
+    }
+
+    if (failedFiles.length > 0) {
+      logCreateStudyPlanWarn(operationId, "Creacion parcial: algunos PDFs no se subieron", {
+        planId,
+        totalUploaded: createdDocumentIds.length,
+        totalFailed: failedFiles.length,
+        failedFiles,
+      });
     }
 
     logCreateStudyPlanInfo(operationId, "Creacion y registro de PDF completados", {
       planId,
-      documentId: payload.document.id,
-      pageCount: payload.document.pageCount,
-      fileSizeBytes: payload.document.fileSizeBytes,
+      totalDocuments: createdDocumentIds.length,
+      totalFailed: failedFiles.length,
       durationMs: Date.now() - startedAt,
     });
 
     return {
       planId,
-      documentId: payload.document.id,
+      documentIds: createdDocumentIds,
+      failedFiles,
     };
   } catch (error) {
     logCreateStudyPlanError(operationId, "Fallo durante subida del PDF", error, {

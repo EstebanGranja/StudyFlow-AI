@@ -15,6 +15,7 @@ type StudyDocument = {
   nombre: string;
   file_url: string;
   page_count?: number | null;
+  display_order?: number | null;
   file_size_bytes?: number | null;
   plan_id: string | null;
   status: DocumentStatus;
@@ -47,6 +48,7 @@ type UploadDocumentInput = {
   storagePath: string;
   pageCount: number | null;
   fileSizeBytes: number;
+  displayOrder: number | null;
 };
 
 class BadRequestError extends Error {}
@@ -353,6 +355,38 @@ async function fetchStudyPlan(
   return data as StudyPlan;
 }
 
+async function getNextDocumentDisplayOrder(
+  client: ReturnType<typeof createClient>,
+  studyPlanId: string,
+  userId: string,
+): Promise<number | null> {
+  const { data, error } = await client.database
+    .from("study_documents")
+    .select("display_order")
+    .eq("plan_id", studyPlanId)
+    .eq("user_id", userId)
+    .order("display_order", { ascending: false })
+    .limit(1);
+
+  if (error) {
+    const { code, message } = extractDatabaseErrorInfo(error);
+
+    if (isMissingColumnError(code, message)) {
+      return null;
+    }
+
+    throw new Error(`Failed to get next document display order: ${message || "Unknown error"}`);
+  }
+
+  const currentMax = (data?.[0] as { display_order?: number | null } | undefined)?.display_order;
+
+  if (typeof currentMax === "number" && Number.isFinite(currentMax)) {
+    return Math.trunc(currentMax) + 1;
+  }
+
+  return 0;
+}
+
 async function createDocumentFromUpload(
   client: ReturnType<typeof createClient>,
   input: UploadDocumentInput,
@@ -368,7 +402,21 @@ async function createDocumentFromUpload(
     status: "done" as const,
   };
 
+  const orderingPayload =
+    typeof input.displayOrder === "number" && Number.isFinite(input.displayOrder)
+      ? {
+          display_order: Math.max(0, Math.trunc(input.displayOrder)),
+        }
+      : {};
+
   const metadataPayload = {
+    ...requiredPayload,
+    ...orderingPayload,
+    page_count: input.pageCount,
+    file_size_bytes: input.fileSizeBytes,
+  };
+
+  const metadataPayloadWithoutOrder = {
     ...requiredPayload,
     page_count: input.pageCount,
     file_size_bytes: input.fileSizeBytes,
@@ -381,9 +429,18 @@ async function createDocumentFromUpload(
     storage_path: input.storagePath,
   };
 
+  const legacyCompatiblePayloadWithoutOrder = {
+    ...metadataPayloadWithoutOrder,
+    title: documentName,
+    source_file_name: input.fileName,
+    storage_path: input.storagePath,
+  };
+
   const payloadAttempts: Array<Record<string, unknown>> = [
     legacyCompatiblePayload,
     metadataPayload,
+    legacyCompatiblePayloadWithoutOrder,
+    metadataPayloadWithoutOrder,
     requiredPayload,
   ];
 
@@ -420,6 +477,7 @@ function buildSimpleResponse(document: StudyDocument) {
       fileName: document.nombre,
       fileUrl: document.file_url,
       pageCount: document.page_count ?? null,
+      displayOrder: document.display_order ?? null,
       fileSizeBytes: document.file_size_bytes ?? null,
       createdAt: document.created_at ?? null,
     },
@@ -486,6 +544,7 @@ export async function POST(request: Request): Promise<Response> {
       });
 
       const metadata = extractPdfMetadata(parsedRequest.pdfBuffer);
+      const nextDisplayOrder = await getNextDocumentDisplayOrder(client, studyPlan.id, currentUserId);
 
       document = await createDocumentFromUpload(client, {
         studyPlanId: studyPlan.id,
@@ -495,6 +554,7 @@ export async function POST(request: Request): Promise<Response> {
         storagePath: `gs://${uploadResult.bucketName}/${uploadResult.objectPath}`,
         pageCount: metadata.pageCount,
         fileSizeBytes: metadata.fileSizeBytes,
+        displayOrder: nextDisplayOrder,
       });
 
       await updateStudyPlanStatus(client, studyPlan.id, "done");
@@ -529,6 +589,7 @@ export async function POST(request: Request): Promise<Response> {
       documentId: document.id,
       studyPlanId: document.plan_id,
       pageCount: document.page_count ?? null,
+      displayOrder: document.display_order ?? null,
       fileSizeBytes: document.file_size_bytes ?? null,
       durationMs: totalDurationMs,
     });
@@ -592,6 +653,7 @@ export async function GET(request: Request): Promise<Response> {
         fileName: document.nombre,
         fileUrl: document.file_url,
         pageCount: document.page_count ?? null,
+        displayOrder: document.display_order ?? null,
         fileSizeBytes: document.file_size_bytes ?? null,
         createdAt: document.created_at ?? null,
       },

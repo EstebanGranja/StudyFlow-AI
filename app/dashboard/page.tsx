@@ -25,7 +25,7 @@ type StudyPlanSummary = {
   id: string;
   nombre: string;
   description: string | null;
-  nivel: string | null;
+  fecha_examen: string | null;
   status: "processing" | "done" | "error";
   created_at: string;
 };
@@ -45,6 +45,25 @@ function formatPlanStatus(status: StudyPlanSummary["status"]): string {
   }
 
   return "Con error";
+}
+
+function formatExamDate(examDate: string | null): string {
+  if (!examDate) {
+    return "Sin definir";
+  }
+
+  const parsedDate = new Date(examDate);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return "Sin definir";
+  }
+
+  return new Intl.DateTimeFormat("es-AR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(parsedDate);
 }
 
 export default function DashboardPage() {
@@ -95,7 +114,7 @@ export default function DashboardPage() {
 
       const { data: plansData, error: plansError } = await client.database
         .from("study_plans")
-        .select("id, nombre, description, nivel, status, created_at")
+        .select("id, nombre, description, fecha_examen, status, created_at")
         .eq("user_id", sessionUser.id)
         .order("created_at", { ascending: false });
 
@@ -262,7 +281,7 @@ export default function DashboardPage() {
                       )}
 
                       <div className="mt-4 flex items-center justify-between text-[11px] text-zinc-500">
-                        <span>Nivel: {plan.nivel ?? "Sin definir"}</span>
+                        <span>Examen: {formatExamDate(plan.fecha_examen)}</span>
                         <span>{new Date(plan.created_at).toLocaleDateString()}</span>
                       </div>
                     </Link>
