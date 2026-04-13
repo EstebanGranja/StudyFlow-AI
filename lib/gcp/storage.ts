@@ -20,7 +20,20 @@ export type UploadPdfToGcsInput = {
   pdfBuffer: Buffer;
 };
 
+export type UploadAvatarToGcsInput = {
+  userId: string;
+  fileName: string;
+  imageBuffer: Buffer;
+  contentType: "image/jpeg" | "image/png" | "image/webp";
+};
+
 export type UploadPdfToGcsResult = {
+  bucketName: string;
+  objectPath: string;
+  fileUrl: string;
+};
+
+export type UploadAvatarToGcsResult = {
   bucketName: string;
   objectPath: string;
   fileUrl: string;
@@ -125,6 +138,25 @@ function buildObjectPath(input: UploadPdfToGcsInput): string {
   const objectId = `${Date.now()}-${crypto.randomUUID()}`;
 
   return `study-plans/${input.userId}/${input.studyPlanId}/${objectId}-${safeFileName}`;
+}
+
+function getAvatarFileExtension(contentType: UploadAvatarToGcsInput["contentType"]): string {
+  if (contentType === "image/jpeg") {
+    return "jpg";
+  }
+
+  if (contentType === "image/png") {
+    return "png";
+  }
+
+  return "webp";
+}
+
+function buildAvatarObjectPath(input: UploadAvatarToGcsInput): string {
+  const extension = getAvatarFileExtension(input.contentType);
+  const objectId = `${Date.now()}-${crypto.randomUUID()}`;
+
+  return `avatars/${input.userId}/${objectId}.${extension}`;
 }
 
 function parseGcsReference(fileUrl: string): GcsObjectReference | null {
@@ -244,6 +276,51 @@ export async function uploadPdfToGCS(input: UploadPdfToGcsInput): Promise<Upload
   };
 }
 
+export async function uploadAvatarToGCS(input: UploadAvatarToGcsInput): Promise<UploadAvatarToGcsResult> {
+  if (!input.imageBuffer || input.imageBuffer.length === 0) {
+    throw new Error("Avatar buffer is empty");
+  }
+
+  const storage = getStorageClient();
+  const bucketName = getRequiredEnv("GCP_BUCKET_NAME");
+  const objectPath = buildAvatarObjectPath(input);
+  const file = storage.bucket(bucketName).file(objectPath);
+
+  await file.save(input.imageBuffer, {
+    resumable: false,
+    contentType: input.contentType,
+    metadata: {
+      contentType: input.contentType,
+      metadata: {
+        original_file_name: sanitizeFileName(input.fileName),
+        user_id: input.userId,
+      },
+    },
+  });
+
+  const mode = getUploadUrlMode();
+
+  if (mode === "public") {
+    return {
+      bucketName,
+      objectPath,
+      fileUrl: buildPublicUrl(bucketName, objectPath),
+    };
+  }
+
+  const [fileUrl] = await file.getSignedUrl({
+    version: "v4",
+    action: "read",
+    expires: Date.now() + getSignedUrlTtlSeconds() * 1000,
+  });
+
+  return {
+    bucketName,
+    objectPath,
+    fileUrl,
+  };
+}
+
 export async function downloadPdfFromGCSUrl(fileUrl: string): Promise<Buffer | null> {
   const reference = parseGcsReference(fileUrl);
 
@@ -257,7 +334,7 @@ export async function downloadPdfFromGCSUrl(fileUrl: string): Promise<Buffer | n
   return buffer;
 }
 
-export async function deletePdfFromGCSUrl(fileUrl: string): Promise<DeletePdfFromGcsUrlResult> {
+async function deleteObjectFromGCSUrl(fileUrl: string): Promise<DeletePdfFromGcsUrlResult> {
   const reference = parseGcsReference(fileUrl);
 
   if (!reference) {
@@ -277,4 +354,12 @@ export async function deletePdfFromGCSUrl(fileUrl: string): Promise<DeletePdfFro
     deleted: true,
     skipped: false,
   };
+}
+
+export async function deletePdfFromGCSUrl(fileUrl: string): Promise<DeletePdfFromGcsUrlResult> {
+  return deleteObjectFromGCSUrl(fileUrl);
+}
+
+export async function deleteAvatarFromGCSUrl(fileUrl: string): Promise<DeletePdfFromGcsUrlResult> {
+  return deleteObjectFromGCSUrl(fileUrl);
 }

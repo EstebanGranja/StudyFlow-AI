@@ -109,3 +109,5 @@ Aplica en orden:
 - `insforge/sql/006_study_plans_exam_date.sql`
 - `insforge/sql/007_study_documents_progress.sql`
 - `insforge/sql/008_study_documents_display_order.sql`
+- `insforge/sql/009_study_plan_links.sql`
+- `insforge/sql/010_user_settings_avatar.sql`

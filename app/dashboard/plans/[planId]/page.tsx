@@ -4,12 +4,15 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
   type ChangeEvent,
+  type FormEvent,
   type KeyboardEvent,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import { FaFilePdf, FaGithub, FaGoogle, FaWikipediaW } from "react-icons/fa";
+import { FiExternalLink, FiLink } from "react-icons/fi";
 import { getInsforgeClient } from "@/lib/insforge/client";
 
 type StudyPlan = {
@@ -35,7 +38,18 @@ type StudyDocument = {
 
 type UserSettings = {
   display_name: string | null;
+  avatar_url: string | null;
 };
+
+type StudyPlanLink = {
+  id: string;
+  nombre: string;
+  url: string;
+  site_name: string | null;
+  created_at: string;
+};
+
+type LinkSiteKey = "github" | "wikipedia" | "google" | "generic";
 
 type ProcessDocumentResponse = {
   success?: boolean;
@@ -130,6 +144,121 @@ function getDisplayNameFallback(user: unknown): string {
   }
 
   return "Sin nombre";
+}
+
+function getAvatarInitial(displayName: string): string {
+  const initial = displayName.trim().charAt(0);
+
+  if (initial) {
+    return initial.toUpperCase();
+  }
+
+  return "U";
+}
+
+function normalizeLinkUrl(rawValue: string): string | null {
+  const trimmedValue = rawValue.trim();
+
+  if (!trimmedValue) {
+    return null;
+  }
+
+  const urlCandidate = /^https?:\/\//i.test(trimmedValue) ? trimmedValue : `https://${trimmedValue}`;
+
+  try {
+    const parsed = new URL(urlCandidate);
+
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function getDomainLabel(url: string): string {
+  try {
+    const hostName = new URL(url).hostname.toLowerCase();
+    return hostName.replace(/^www\./, "");
+  } catch {
+    return "sitio externo";
+  }
+}
+
+function detectLinkSiteKey(url: string): LinkSiteKey {
+  const domainLabel = getDomainLabel(url);
+
+  if (domainLabel.includes("github.com")) {
+    return "github";
+  }
+
+  if (domainLabel.includes("wikipedia.org") || domainLabel.includes("wikimedia.org")) {
+    return "wikipedia";
+  }
+
+  if (domainLabel.includes("google.")) {
+    return "google";
+  }
+
+  return "generic";
+}
+
+function getLinkSiteInfo(url: string, siteName: string | null): {
+  siteKey: LinkSiteKey;
+  siteLabel: string;
+} {
+  const siteKey = detectLinkSiteKey(url);
+
+  if (siteName && siteName.trim().length > 0) {
+    return {
+      siteKey,
+      siteLabel: siteName.trim(),
+    };
+  }
+
+  if (siteKey === "github") {
+    return {
+      siteKey,
+      siteLabel: "GitHub",
+    };
+  }
+
+  if (siteKey === "wikipedia") {
+    return {
+      siteKey,
+      siteLabel: "Wikipedia",
+    };
+  }
+
+  if (siteKey === "google") {
+    return {
+      siteKey,
+      siteLabel: "Google",
+    };
+  }
+
+  return {
+    siteKey,
+    siteLabel: getDomainLabel(url),
+  };
+}
+
+function renderLinkSiteIcon(siteKey: LinkSiteKey) {
+  if (siteKey === "github") {
+    return <FaGithub className="h-4 w-4" aria-hidden="true" />;
+  }
+
+  if (siteKey === "wikipedia") {
+    return <FaWikipediaW className="h-4 w-4" aria-hidden="true" />;
+  }
+
+  if (siteKey === "google") {
+    return <FaGoogle className="h-4 w-4" aria-hidden="true" />;
+  }
+
+  return <FiLink className="h-4 w-4" aria-hidden="true" />;
 }
 
 function getDocumentTotalPages(document: StudyDocument): number | null {
@@ -269,6 +398,32 @@ function getCountdownClasses(tone: "neutral" | "good" | "warning" | "danger"): s
   return "border-zinc-700 bg-zinc-950 text-zinc-300";
 }
 
+function getExamCountdownLabel(examDate: string | null): string {
+  const daysUntilExam = getDaysUntilExam(examDate);
+
+  if (daysUntilExam === null) {
+    return "Define la fecha de examen";
+  }
+
+  if (daysUntilExam > 1) {
+    return `Faltan ${daysUntilExam} dias para el examen`;
+  }
+
+  if (daysUntilExam === 1) {
+    return "Falta 1 dia para el examen";
+  }
+
+  if (daysUntilExam === 0) {
+    return "El examen es hoy";
+  }
+
+  if (daysUntilExam === -1) {
+    return "El examen fue ayer";
+  }
+
+  return `El examen fue hace ${Math.abs(daysUntilExam)} dias`;
+}
+
 function buildPdfPreviewUrl(fileUrl: string): string {
   if (fileUrl.includes("#")) {
     return fileUrl;
@@ -331,6 +486,15 @@ export default function StudyPlanDetailPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [plan, setPlan] = useState<StudyPlan | null>(null);
   const [creatorDisplayName, setCreatorDisplayName] = useState("Sin nombre");
+  const [creatorAvatarUrl, setCreatorAvatarUrl] = useState<string | null>(null);
+  const [planLinks, setPlanLinks] = useState<StudyPlanLink[]>([]);
+  const [planLinksErrorMessage, setPlanLinksErrorMessage] = useState<string | null>(null);
+  const [showAddLinkForm, setShowAddLinkForm] = useState(false);
+  const [newLinkName, setNewLinkName] = useState("");
+  const [newLinkUrl, setNewLinkUrl] = useState("");
+  const [isSavingLink, setIsSavingLink] = useState(false);
+  const [saveLinkErrorMessage, setSaveLinkErrorMessage] = useState<string | null>(null);
+  const [saveLinkSuccessMessage, setSaveLinkSuccessMessage] = useState<string | null>(null);
   const [documents, setDocuments] = useState<StudyDocument[]>([]);
   const [currentUserId, setCurrentUserId] = useState<string>("");
   const [progressByDocumentId, setProgressByDocumentId] = useState<Record<string, number>>({});
@@ -355,6 +519,10 @@ export default function StudyPlanDetailPage() {
 
   const examCountdown = useMemo(() => {
     return formatExamCountdown(plan?.fecha_examen ?? null);
+  }, [plan?.fecha_examen]);
+
+  const examCountdownLabel = useMemo(() => {
+    return getExamCountdownLabel(plan?.fecha_examen ?? null);
   }, [plan?.fecha_examen]);
 
   const planProgress = useMemo(() => {
@@ -475,17 +643,21 @@ export default function StudyPlanDetailPage() {
       const displayNameFallback = getDisplayNameFallback(currentUser);
       const { data: settingsData, error: settingsError } = await client.database
         .from("user_settings")
-        .select("display_name")
+        .select("display_name, avatar_url")
         .eq("user_id", userId)
         .maybeSingle();
 
+      const settingsRow = settingsData as UserSettings | null;
       const resolvedDisplayName =
-        !settingsError && (settingsData as UserSettings | null)?.display_name?.trim()
-          ? (settingsData as UserSettings).display_name!.trim()
+        !settingsError && settingsRow?.display_name?.trim()
+          ? settingsRow.display_name.trim()
           : displayNameFallback;
+
+      const resolvedAvatarUrl = !settingsError && settingsRow?.avatar_url ? settingsRow.avatar_url : null;
 
       if (!isCancelled) {
         setCreatorDisplayName(resolvedDisplayName);
+        setCreatorAvatarUrl(resolvedAvatarUrl);
       }
 
       const { data: planData, error: planError } = await client.database
@@ -505,6 +677,8 @@ export default function StudyPlanDetailPage() {
 
       let resolvedDocuments: StudyDocument[] = [];
       let docsErrorMessage: string | null = null;
+      let resolvedPlanLinks: StudyPlanLink[] = [];
+      let linksErrorMessage: string | null = null;
 
       const docsWithOrderResult = await client.database
         .from("study_documents")
@@ -551,6 +725,28 @@ export default function StudyPlanDetailPage() {
         }));
       }
 
+      const linksResult = await client.database
+        .from("study_plan_links")
+        .select("id, nombre, url, site_name, created_at")
+        .eq("plan_id", planId)
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false });
+
+      if (linksResult.error) {
+        const normalizedLinksError = linksResult.error.message.toLowerCase();
+        const isMissingLinksTable =
+          normalizedLinksError.includes("study_plan_links") &&
+          (normalizedLinksError.includes("does not exist") ||
+            normalizedLinksError.includes("not found") ||
+            normalizedLinksError.includes("42p01"));
+
+        linksErrorMessage = isMissingLinksTable
+          ? "La seccion de links de utilidad requiere la migracion insforge/sql/009_study_plan_links.sql."
+          : linksResult.error.message;
+      } else {
+        resolvedPlanLinks = (linksResult.data as StudyPlanLink[] | null) ?? [];
+      }
+
       if (!isCancelled) {
         setPlan(planData as StudyPlan);
 
@@ -560,6 +756,14 @@ export default function StudyPlanDetailPage() {
         } else {
           setErrorMessage(null);
           setDocuments(sortDocumentsByDisplayOrder(resolvedDocuments));
+        }
+
+        if (linksErrorMessage) {
+          setPlanLinksErrorMessage(linksErrorMessage);
+          setPlanLinks([]);
+        } else {
+          setPlanLinksErrorMessage(null);
+          setPlanLinks(resolvedPlanLinks);
         }
 
         setIsLoading(false);
@@ -753,6 +957,62 @@ export default function StudyPlanDetailPage() {
     }
 
     return token;
+  }
+
+  async function handleSubmitNewLink(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+
+    if (!currentUserId) {
+      setSaveLinkErrorMessage("No hay sesion activa para agregar links.");
+      setSaveLinkSuccessMessage(null);
+      return;
+    }
+
+    const normalizedUrl = normalizeLinkUrl(newLinkUrl);
+
+    if (!normalizedUrl) {
+      setSaveLinkErrorMessage("Ingresa una URL valida. Puedes pegarla con o sin https://");
+      setSaveLinkSuccessMessage(null);
+      return;
+    }
+
+    const siteInfo = getLinkSiteInfo(normalizedUrl, null);
+    const finalLinkName = newLinkName.trim().length > 0 ? newLinkName.trim() : siteInfo.siteLabel;
+
+    setIsSavingLink(true);
+    setSaveLinkErrorMessage(null);
+    setSaveLinkSuccessMessage(null);
+
+    try {
+      const client = getInsforgeClient();
+      const { data, error } = await client.database
+        .from("study_plan_links")
+        .insert([
+          {
+            plan_id: planId,
+            user_id: currentUserId,
+            nombre: finalLinkName,
+            url: normalizedUrl,
+            site_name: siteInfo.siteLabel,
+          },
+        ])
+        .select("id, nombre, url, site_name, created_at")
+        .single();
+
+      if (error || !data) {
+        throw new Error(error?.message ?? "No se pudo guardar el link.");
+      }
+
+      setPlanLinks((previousLinks) => [data as StudyPlanLink, ...previousLinks]);
+      setNewLinkName("");
+      setNewLinkUrl("");
+      setSaveLinkSuccessMessage("Link agregado correctamente.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "No se pudo guardar el link.";
+      setSaveLinkErrorMessage(message);
+    } finally {
+      setIsSavingLink(false);
+    }
   }
 
   function getApiProcessError(payload: ProcessDocumentResponse | null): string {
@@ -965,17 +1225,32 @@ export default function StudyPlanDetailPage() {
       <main className="mx-auto w-full max-w-4xl space-y-6">
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-8">
           <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
+            <div className="min-w-0">
               <p className="text-sm uppercase tracking-[0.14em] text-teal-300">Plan de estudio</p>
               <h1 className="mt-2 text-3xl font-semibold text-white">{plan.nombre}</h1>
-              <p className="mt-3 text-sm text-zinc-300">
-                Creado por: <span className="font-semibold text-zinc-100">{creatorDisplayName}</span> el{" "}
-                {formatCreatedByDate(plan.created_at)}
-              </p>
+
+              <div className="mt-3 flex min-w-0 items-center gap-3 text-sm text-zinc-300">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full border border-zinc-700 bg-zinc-950 text-sm font-semibold text-teal-200">
+                  {creatorAvatarUrl ? (
+                    <img
+                      src={creatorAvatarUrl}
+                      alt={`Avatar de ${creatorDisplayName}`}
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <span aria-hidden="true">{getAvatarInitial(creatorDisplayName)}</span>
+                  )}
+                </div>
+
+                <p className="min-w-0 truncate">
+                  Creado por: <span className="font-semibold text-zinc-100">{creatorDisplayName}</span> el{" "}
+                  {formatCreatedByDate(plan.created_at)}
+                </p>
+              </div>
             </div>
             <Link
               href="/dashboard"
-              className="inline-flex h-10 items-center justify-center rounded-lg border border-zinc-700 px-4 text-sm font-semibold text-zinc-100 transition hover:border-zinc-500 hover:bg-zinc-800"
+              className="inline-flex h-10 items-center justify-center rounded-lg bg-teal-300 px-4 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200"
             >
               Volver al dashboard
             </Link>
@@ -983,9 +1258,15 @@ export default function StudyPlanDetailPage() {
 
           {plan.description ? <p className="mt-5 text-sm leading-6 text-zinc-300">{plan.description}</p> : null}
 
-          <div className="mt-6 flex flex-wrap gap-3 text-xs">
-            <span className="rounded-full border border-zinc-700 bg-zinc-950 px-3 py-1 text-zinc-300">
-              Examen: {formatExamDate(plan.fecha_examen)}
+          <div className="mt-6 flex flex-wrap items-center gap-3">
+            <span className="rounded-xl border border-zinc-700 bg-zinc-950 px-4 py-2 text-sm font-semibold text-zinc-200">
+              Fecha de examen: {formatExamDate(plan.fecha_examen)}
+            </span>
+
+            <span
+              className={`rounded-xl border px-4 py-2 text-sm font-medium ${getCountdownClasses(examCountdown.tone)}`}
+            >
+              {examCountdownLabel}
             </span>
           </div>
 
@@ -1015,9 +1296,131 @@ export default function StudyPlanDetailPage() {
             </p>
           </div>
 
-          <div className={`mt-4 rounded-xl border px-4 py-3 text-sm ${getCountdownClasses(examCountdown.tone)}`}>
-            {examCountdown.message}
+        </section>
+
+        <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-8">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-xl font-semibold text-white">Links de utilidad</h2>
+              <p className="mt-1 text-xs text-zinc-400">
+                Guarda recursos externos para este plan y abrelos rapido desde aqui.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setShowAddLinkForm((currentValue) => !currentValue);
+                setSaveLinkErrorMessage(null);
+                setSaveLinkSuccessMessage(null);
+              }}
+              className="inline-flex h-10 items-center justify-center rounded-lg bg-teal-300 px-4 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200"
+            >
+              {showAddLinkForm ? "Cerrar" : "Agregar links de utilidad"}
+            </button>
           </div>
+
+          {showAddLinkForm ? (
+            <form onSubmit={(event) => void handleSubmitNewLink(event)} className="mt-4 rounded-xl border border-zinc-800 bg-zinc-950/70 p-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label htmlFor="new-plan-link-name" className="mb-2 block text-xs uppercase tracking-[0.08em] text-zinc-400">
+                    Nombre del link
+                  </label>
+                  <input
+                    id="new-plan-link-name"
+                    type="text"
+                    value={newLinkName}
+                    onChange={(event) => setNewLinkName(event.target.value)}
+                    placeholder="Ej: Repo principal"
+                    className="h-10 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none transition focus:border-teal-300/70"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="new-plan-link-url" className="mb-2 block text-xs uppercase tracking-[0.08em] text-zinc-400">
+                    URL
+                  </label>
+                  <input
+                    id="new-plan-link-url"
+                    type="text"
+                    value={newLinkUrl}
+                    onChange={(event) => setNewLinkUrl(event.target.value)}
+                    placeholder="https://github.com/..."
+                    required
+                    className="h-10 w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none transition focus:border-teal-300/70"
+                  />
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="submit"
+                  disabled={isSavingLink}
+                  className="inline-flex h-9 items-center justify-center rounded-lg bg-teal-300 px-4 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isSavingLink ? "Guardando..." : "Guardar link"}
+                </button>
+              </div>
+
+              {saveLinkErrorMessage ? (
+                <p className="mt-3 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                  {saveLinkErrorMessage}
+                </p>
+              ) : null}
+
+              {saveLinkSuccessMessage ? (
+                <p className="mt-3 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+                  {saveLinkSuccessMessage}
+                </p>
+              ) : null}
+            </form>
+          ) : null}
+
+          {planLinksErrorMessage ? (
+            <p className="mt-4 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+              {planLinksErrorMessage}
+            </p>
+          ) : null}
+
+          {planLinks.length === 0 ? (
+            <p className="mt-4 text-sm text-zinc-400">Aun no agregaste links de utilidad para este plan.</p>
+          ) : (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              {planLinks.map((planLink) => {
+                const siteInfo = getLinkSiteInfo(planLink.url, planLink.site_name);
+
+                return (
+                  <a
+                    key={planLink.id}
+                    href={planLink.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="group rounded-xl border border-zinc-700 bg-zinc-950/70 p-4 transition hover:border-teal-300/50 hover:bg-zinc-900"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-900 text-teal-200">
+                          {renderLinkSiteIcon(siteInfo.siteKey)}
+                        </span>
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-zinc-100">{planLink.nombre}</p>
+                          <p className="truncate text-xs text-zinc-400">{planLink.url}</p>
+                        </div>
+                      </div>
+
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span className="rounded-full border border-zinc-700 px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-zinc-400">
+                          {siteInfo.siteLabel}
+                        </span>
+                        <FiExternalLink className="h-3.5 w-3.5 text-zinc-500 transition group-hover:text-zinc-200" aria-hidden="true" />
+                      </div>
+                    </div>
+                  </a>
+                );
+              })}
+            </div>
+          )}
         </section>
 
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-8">
@@ -1057,6 +1460,13 @@ export default function StudyPlanDetailPage() {
                 const saveError = saveErrorByDocumentId[document.id];
                 const isFirstDocument = documentIndex === 0;
                 const isLastDocument = documentIndex === documents.length - 1;
+                const previewContainerClasses = isPreviewVisible
+                  ? "border-zinc-800 bg-zinc-900/60"
+                  : "border-red-300/20 bg-red-400/10";
+                const previewTitleClasses = isPreviewVisible ? "text-zinc-400" : "text-red-100/80";
+                const previewButtonClasses = isPreviewVisible
+                  ? "border-zinc-700 text-zinc-200 hover:border-zinc-500 hover:bg-zinc-800"
+                  : "border-red-200/40 bg-red-400/10 text-red-100/90 hover:border-red-200/70 hover:bg-red-400/20";
 
                 return (
                   <article
@@ -1067,35 +1477,21 @@ export default function StudyPlanDetailPage() {
                     className="rounded-2xl border border-zinc-700/80 bg-zinc-950/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] transition-colors duration-200"
                   >
                     <div className="rounded-xl border border-zinc-800/80 bg-zinc-900/40 px-4 py-4">
-                      <div className="mb-3 flex items-center justify-center gap-2 text-[11px] uppercase tracking-[0.1em] text-zinc-400">
-                        <span>Desplazar</span>
-                        <button
-                          type="button"
-                          aria-label={`Subir ${document.nombre}`}
-                          disabled={isPersistingDocumentOrder || isFirstDocument}
-                          onClick={() => handleMoveDocument(document.id, "up")}
-                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-sm font-bold text-zinc-300 transition hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-600"
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`Bajar ${document.nombre}`}
-                          disabled={isPersistingDocumentOrder || isLastDocument}
-                          onClick={() => handleMoveDocument(document.id, "down")}
-                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-sm font-bold text-zinc-300 transition hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-600"
-                        >
-                          ↓
-                        </button>
-                      </div>
-
                       <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div className="space-y-2">
-                          <p className="text-lg font-semibold tracking-[0.01em] text-zinc-100">{document.nombre}</p>
-                          <div className="h-[2px] w-52 max-w-full bg-gradient-to-r from-emerald-300/70 via-emerald-200/30 to-transparent" />
-                          <p className="text-xs text-zinc-500">
-                            Paginas: {document.page_count ?? "N/A"} · Peso: {formatBytes(document.file_size_bytes)}
-                          </p>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-start gap-3">
+                            <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-red-300/35 bg-red-500/15 text-red-200">
+                              <FaFilePdf className="h-5 w-5" aria-hidden="true" />
+                            </span>
+
+                            <div className="min-w-0 space-y-2">
+                              <p className="text-lg font-semibold tracking-[0.01em] text-zinc-100">{document.nombre}</p>
+                              <div className="h-[2px] w-52 max-w-full bg-gradient-to-r from-emerald-300/70 via-emerald-200/30 to-transparent" />
+                              <p className="text-xs text-zinc-500">
+                                Paginas: {document.page_count ?? "N/A"} · Peso: {formatBytes(document.file_size_bytes)}
+                              </p>
+                            </div>
+                          </div>
                         </div>
 
                         <a
@@ -1182,22 +1578,22 @@ export default function StudyPlanDetailPage() {
                       ) : null}
                     </div>
 
-                    <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/60 p-3">
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <p className="text-xs uppercase tracking-[0.1em] text-zinc-400">Vista previa del PDF</p>
+                    <div className={`mt-4 rounded-xl border p-4 ${previewContainerClasses}`}>
+                      <div className="flex flex-wrap items-center justify-between gap-3 pl-1">
+                        <p className={`text-xs uppercase tracking-[0.1em] ${previewTitleClasses}`}>Vista previa del PDF</p>
                         <button
                           type="button"
                           onClick={() =>
                             setPreviewDocumentId((currentId) => (currentId === document.id ? null : document.id))
                           }
-                          className="inline-flex h-8 items-center justify-center rounded-lg border border-zinc-700 px-3 text-xs font-semibold text-zinc-200 transition hover:border-zinc-500 hover:bg-zinc-800"
+                          className={`inline-flex h-8 items-center justify-center rounded-lg border px-3 text-xs font-semibold transition ${previewButtonClasses}`}
                         >
                           {isPreviewVisible ? "Ocultar vista previa" : "Ver vista previa"}
                         </button>
                       </div>
 
                       {isPreviewVisible ? (
-                        <div className="mt-3 overflow-hidden rounded-lg border border-zinc-800 bg-black">
+                        <div className="mt-4 overflow-hidden rounded-lg border border-zinc-800 bg-black">
                           <iframe
                             src={buildPdfPreviewUrl(document.file_url)}
                             title={`Vista previa de ${document.nombre}`}
@@ -1205,10 +1601,34 @@ export default function StudyPlanDetailPage() {
                           />
                         </div>
                       ) : (
-                        <p className="mt-2 text-xs text-zinc-500">
+                        <p className="mt-3 pl-1 text-xs leading-5 text-red-100/70">
                           Activa la vista previa para revisar el PDF sin salir de esta pantalla.
                         </p>
                       )}
+                    </div>
+
+                    <div className="mt-4 flex justify-center">
+                      <div className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900/70 px-3 py-2 text-[11px] uppercase tracking-[0.1em] text-zinc-400">
+                        <span>Desplazar</span>
+                        <button
+                          type="button"
+                          aria-label={`Subir ${document.nombre}`}
+                          disabled={isPersistingDocumentOrder || isFirstDocument}
+                          onClick={() => handleMoveDocument(document.id, "up")}
+                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-sm font-bold text-zinc-300 transition hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-600"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Bajar ${document.nombre}`}
+                          disabled={isPersistingDocumentOrder || isLastDocument}
+                          onClick={() => handleMoveDocument(document.id, "down")}
+                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-sm font-bold text-zinc-300 transition hover:bg-zinc-800 hover:text-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-600"
+                        >
+                          ↓
+                        </button>
+                      </div>
                     </div>
                   </article>
                 );

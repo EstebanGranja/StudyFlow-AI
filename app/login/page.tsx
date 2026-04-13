@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
+import { LoadingSpinner } from "@/components/loading-spinner";
 import { getInsforgeClient } from "@/lib/insforge/client";
 import { ensureUserSettings } from "@/lib/insforge/ensure-user-settings";
 
@@ -163,9 +164,16 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={isSubmitting || isGoogleSubmitting}
-            className="mt-1 inline-flex h-11 w-full items-center justify-center rounded-xl bg-zinc-100 text-base font-semibold text-zinc-900 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer"
+            className="mt-1 inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-zinc-100 text-base font-semibold text-zinc-900 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer"
           >
-            {isSubmitting ? "Iniciando..." : "Iniciar sesion"}
+            {isSubmitting ? (
+              <>
+                <LoadingSpinner size="sm" className="border-zinc-400 border-t-zinc-900" />
+                Iniciando...
+              </>
+            ) : (
+              "Iniciar sesion"
+            )}
           </button>
         </form>
 

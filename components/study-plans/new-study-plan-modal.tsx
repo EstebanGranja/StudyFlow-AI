@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { LoadingSpinner } from "@/components/loading-spinner";
 import { createStudyPlan } from "@/lib/study-plans/create-study-plan";
 
 type NewStudyPlanModalProps = {
@@ -199,9 +200,16 @@ export function NewStudyPlanModal({ isOpen, onClose }: NewStudyPlanModalProps) {
             <button
               type="submit"
               disabled={isSubmitting}
-              className="inline-flex h-10 items-center justify-center rounded-lg bg-teal-300 px-5 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-300 px-5 text-sm font-semibold text-zinc-900 transition hover:bg-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {isSubmitting ? "Creando y subiendo PDFs..." : "Crear plan"}
+              {isSubmitting ? (
+                <>
+                  <LoadingSpinner size="sm" className="border-zinc-500 border-t-zinc-900" />
+                  Creando y subiendo PDFs...
+                </>
+              ) : (
+                "Crear plan"
+              )}
             </button>
           </div>
         </form>
